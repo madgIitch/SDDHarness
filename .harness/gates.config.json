@@ -1,0 +1,6 @@
+{
+  "gates": [
+    { "name": "test", "cmd": "echo 'TODO: define un comando de tests' && false", "blocking": true },
+    { "name": "diff-scope", "blocking": true }
+  ]
+}

@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # init.sh — Bootstrap del SDD Harness (agnóstico de repo y de agente).
-# Crea .harness/ completo, detecta el stack, escribe gates.config.json,
-# deja punteros en CLAUDE.md/AGENTS.md, parchea .gitignore y verifica el CLI.
+# Crea .harness/ + capa de memoria (docs/ spec/ progress/), detecta el stack,
+# escribe gates.config.json, deja punteros en CLAUDE.md/AGENTS.md, parchea
+# .gitignore y verifica el CLI del agente.
 #
 # Uso:
-#   bash init.sh            # instala (no clobbera spec.json ni los punteros si ya existen)
+#   bash init.sh            # instala (no clobbera spec.json, memoria ni punteros)
 #   bash init.sh --force    # reescribe también los scripts de .harness/
 #
 # Requisitos: bash, git, node. Elige agente con HARNESS_AGENT=claude|codex (def. claude).
@@ -20,7 +21,7 @@ step() { printf '\n== %s\n' "$1"; }
 warn() { printf '  ⚠️  %s\n' "$1" >&2; }
 die()  { printf '\n❌ %s\n' "$1" >&2; exit 1; }
 
-write() {  # write <path> <heredoc-delim>  (lee el cuerpo de stdin)
+write() {  # write <path>  (lee el cuerpo de stdin; salta .harness/* si ya existe y no hay --force)
   local path="$1"
   if [ -e "$path" ] && [ "$FORCE" -ne 1 ]; then
     case "$path" in
@@ -29,6 +30,12 @@ write() {  # write <path> <heredoc-delim>  (lee el cuerpo de stdin)
   fi
   cat > "$path"
   say "escrito $path"
+}
+
+seed() {  # seed <path>  (crea solo si falta; nunca clobbera la memoria)
+  local path="$1"
+  if [ -e "$path" ]; then say "salto $path (ya existe)"; cat >/dev/null; return; fi
+  cat > "$path"; say "creado $path"
 }
 
 step "Comprobaciones previas"
@@ -98,6 +105,7 @@ import { runAgent, extractJson } from "./runner.mjs";
 
 const SPEC = "spec.json";
 const IDIR = ".harness/interviews";
+const SPECDIR = "spec";
 
 const DIMENSIONS = [
   "data_model", "error_states", "edge_cases", "auth_secrets",
@@ -105,6 +113,7 @@ const DIMENSIONS = [
 ];
 
 const sh = (cmd) => execSync(cmd, { stdio: "pipe", encoding: "utf8" });
+const tryCommit = (paths, msg) => { try { sh(`git add ${paths}`); sh(`git commit -q -m ${JSON.stringify(msg)} -- ${paths}`); } catch {} };
 const loadSpec = () => JSON.parse(readFileSync(SPEC, "utf8"));
 const saveSpec = (s) => writeFileSync(SPEC, JSON.stringify(s, null, 2));
 const scPath = (id) => `${IDIR}/${id}.json`;
@@ -118,6 +127,22 @@ function feature(spec, id) {
   return f;
 }
 
+// Escribe el spec aprobado y destilado a spec/<id>-<name>.md (memoria durable).
+function writeSpecDoc(f, sc) {
+  mkdirSync(SPECDIR, { recursive: true });
+  const L = [`# ${f.id} · ${f.title}`, ""];
+  L.push(`- **name:** \`${f.name}\``, `- **priority:** ${f.priority ?? "-"}`, `- **sdd:** ${f.sdd === false ? "false" : "true"}`);
+  L.push(`- **aprobado por:** ${f.approved_by} · ${f.approved_at}`);
+  if (f.scope?.length) L.push(`- **scope:** ${f.scope.map((s) => `\`${s}\``).join(", ")}`);
+  L.push("", "## Descripción", "", f.description ?? "");
+  if (f.acceptance?.length) { L.push("", "## Criterios de aceptación", ""); f.acceptance.forEach((a, i) => L.push(`${i + 1}. ${a}`)); }
+  if (sc?.dimensions) { L.push("", "## Cobertura por dimensión", ""); for (const [d, v] of Object.entries(sc.dimensions)) L.push(`- **${d}:** ${v.notes ?? (v.addressed ? "ok" : "—")}`); }
+  if (sc?.answers && Object.keys(sc.answers).length) { L.push("", "## Decisiones de la entrevista", ""); for (const [k, v] of Object.entries(sc.answers)) L.push(`- **${k}:** ${v}`); }
+  const path = `${SPECDIR}/${f.id}-${f.name}.md`;
+  writeFileSync(path, L.join("\n") + "\n");
+  return path;
+}
+
 function interview(id) {
   const spec = loadSpec();
   const f = feature(spec, id);
@@ -125,7 +150,7 @@ function interview(id) {
   const prior = existsSync(scPath(id)) ? loadSc(id) : { answers: {} };
   const res = ask([
     "Eres entrevistador de especificaciones (SDD). NO escribas código. Devuelve SOLO JSON.",
-    "Analiza el repo (solo lectura) y esta feature:",
+    "Analiza el repo (solo lectura), lee docs/ si existe, y esta feature:",
     JSON.stringify({ id: f.id, name: f.name, title: f.title, description: f.description, acceptance: f.acceptance ?? [] }),
     `Respuestas previas del dev: ${JSON.stringify(prior.answers)}`,
     `Para CADA dimensión [${DIMENSIONS.join(", ")}] decide si la feature la deja resuelta.`,
@@ -174,15 +199,18 @@ function approve(id) {
   const spec = loadSpec();
   const f = feature(spec, id);
   const by = process.env.USER || process.env.USERNAME || "dev";
+  let sc = null;
   if (f.sdd !== false) {
-    const sc = loadSc(id);
+    sc = loadSc(id);
     if (!sc.ready) throw new Error(`Feature ${id}: spec no listo (ready:false).`);
     if (f.status !== "spec_ready") throw new Error(`Feature ${id} debe estar en spec_ready (está en ${f.status}).`);
     f.answers_hash = "sha256:" + createHash("sha256").update(JSON.stringify(sc.answers)).digest("hex");
   }
   f.spec_approved = true; f.approved_by = by; f.approved_at = new Date().toISOString();
   saveSpec(spec);
-  console.log(`Feature ${id} aprobada por ${by}.`);
+  const doc = writeSpecDoc(f, sc);
+  tryCommit(`spec.json ${doc}`, `spec: approve #${f.id} ${f.name}`);
+  console.log(`Feature ${id} aprobada por ${by}. Spec durable en ${doc}`);
 }
 
 function done(id) {
@@ -203,7 +231,7 @@ SPEC_EOF
 # ---------------------------------------------------------- orchestrator.mjs
 write .harness/orchestrator.mjs <<'ORCH_EOF'
 import { execSync } from "node:child_process";
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { loadSpec, loadState, saveState } from "./state.mjs";
 import { runGates } from "./gates.mjs";
@@ -212,6 +240,7 @@ import { runAgent } from "./runner.mjs";
 
 const DRY = process.argv.includes("--dry-run");
 const PRI = { P0: 0, P1: 1, P2: 2, P3: 3 };
+const PDIR = "progress";
 const sh = (cmd) => execSync(cmd, { stdio: "pipe", encoding: "utf8" });
 
 function approvalStale(f) {
@@ -226,6 +255,25 @@ function consumable(f) {
   if (f.spec_approved !== true) return false;
   if (approvalStale(f)) return false;
   return f.status === "pending" || f.status === "spec_ready";
+}
+
+// Memoria de ejecución: progress/<id>-<name>.md + LOG.md rodante.
+function writeProgress(task, state) {
+  mkdirSync(PDIR, { recursive: true });
+  const path = `${PDIR}/${task.id}-${task.name}.md`;
+  const prior = existsSync(path) ? readFileSync(path, "utf8") : `# ${task.id} · ${task.title}\n\nRegistro de implementación (memoria del proyecto).\n`;
+  const attempts = state.tasks[task.id]?.attempts ?? [];
+  const ts = new Date().toISOString();
+  const rows = attempts.map((a) => {
+    const fg = a.verdict?.passed ? "—" : (String(a.verdict?.failureOutput || "").match(/Gate fallido: ([^\n]+)/)?.[1] ?? "?");
+    return `| ${a.attempt} | ${a.verdict?.passed ? "OK" : "FALLO"} | ${fg} | ${a.tts != null ? a.tts.toFixed(1) : "?"} | ${a.cost ?? "—"} |`;
+  }).join("\n");
+  const block = `\n## ${ts} — estado: ${task.status}\n\n- agente: ${process.env.HARNESS_AGENT || "claude"} · branch: \`harness/${task.name}\`\n\n| intento | resultado | gate fallido | tts(s) | coste |\n|--:|--|--|--:|--:|\n${rows}\n`;
+  writeFileSync(path, prior + block);
+  const logPath = `${PDIR}/LOG.md`;
+  const log = existsSync(logPath) ? readFileSync(logPath, "utf8") : "# Changelog del harness\n\n";
+  writeFileSync(logPath, log + `- ${ts} · #${task.id} ${task.name} → ${task.status} (${attempts.length} intento/s)\n`);
+  try { sh(`git add ${PDIR}`); sh(`git commit -q -m "docs(progress): #${task.id} ${task.name} → ${task.status}" -- ${PDIR}`); } catch {}
 }
 
 async function main() {
@@ -265,6 +313,7 @@ async function main() {
     if (!ok) { task.status = "blocked"; console.error(`⚠️  BLOCKED: ${task.id} ${task.name} falló ${maxAttempts} veces.`); console.error(state.tasks[task.id]?.attempts.at(-1)?.verdict?.failureOutput ?? ""); }
     saveState(state);
     writeFileSync("spec.json", JSON.stringify(spec, null, 2));
+    writeProgress(task, state);
   }
 }
 
@@ -278,14 +327,17 @@ import { execSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 
 const cfg = JSON.parse(readFileSync(new URL("./gates.config.json", import.meta.url)));
+const ALWAYS = ["docs/", "spec/", "progress/"]; // memoria: siempre permitida fuera del scope
+
 function run(cmd) {
   try { return { ok: true, out: execSync(cmd, { stdio: "pipe", encoding: "utf8" }) }; }
   catch (e) { return { ok: false, out: (e.stdout ?? "") + (e.stderr ?? "") }; }
 }
 function diffScopeGate(task) {
   const changed = execSync("git diff --name-only HEAD", { encoding: "utf8" }).split("\n").filter(Boolean);
-  const allowed = task.scope ?? [];
-  if (allowed.length === 0) return { ok: true, out: "" };
+  const declared = task.scope ?? [];
+  if (declared.length === 0) return { ok: true, out: "" };
+  const allowed = [...declared, ...ALWAYS];
   const outside = changed.filter((f) => !allowed.some((p) => f.startsWith(p)));
   return outside.length === 0 ? { ok: true, out: "" } : { ok: false, out: `Archivos fuera de scope: ${outside.join(", ")}` };
 }
@@ -317,12 +369,14 @@ write .harness/prompt.mjs <<'PROMPT_EOF'
 export function buildInitialPrompt(task) {
   return [
     "Implementa esta feature (metodología SDD). El spec ya fue aprobado por el dev.",
+    "Antes de empezar, lee docs/ARCHITECTURE.md, docs/CONVENTIONS.md y docs/DECISIONS.md si existen, y respétalos.",
     `id: ${task.id}  name: ${task.name}`,
     `Título: ${task.title}`,
     `Descripción: ${task.description}`,
-    task.scope?.length ? `SOLO puedes tocar: ${task.scope.join(", ")}` : "",
+    task.scope?.length ? `SOLO puedes tocar: ${task.scope.join(", ")} (además de docs/ para registrar decisiones).` : "",
     "Criterios de aceptación:",
     ...(task.acceptance ?? []).map((a, i) => `  ${i + 1}. ${a}`),
+    "Si tomas una decisión de arquitectura relevante, añádela como entrada nueva en docs/DECISIONS.md.",
     "Reglas: no hagas commits (lo hace el harness), no salgas del scope. Los gates verificarán tu trabajo.",
   ].filter(Boolean).join("\n");
 }
@@ -435,8 +489,80 @@ else
 EOF
 fi
 
+step "Memoria del proyecto (docs/ spec/ progress/)"
+mkdir -p docs spec progress
+
+seed docs/README.md <<'EOF'
+# docs/ — Memoria durable del proyecto
+
+- `ARCHITECTURE.md` — visión general, componentes, flujo de datos.
+- `DECISIONS.md` — registro de decisiones (ADR). El harness añade entradas al tomar decisiones relevantes.
+- `CONVENTIONS.md` — convenciones de código, naming, ramas.
+
+El agente lee esta carpeta antes de implementar. Mantenla actualizada: es lo que un agente nuevo
+(o tú dentro de tres meses) usa para ponerse al día.
+EOF
+
+seed docs/ARCHITECTURE.md <<'EOF'
+# Arquitectura
+
+> Rellena esto. El agente lo lee antes de implementar.
+
+## Visión general
+
+## Componentes
+
+## Flujo de datos
+
+## Decisiones abiertas
+EOF
+
+seed docs/DECISIONS.md <<'EOF'
+# Decisiones (ADR)
+
+Formato por entrada: **fecha · título** — contexto, decisión y consecuencias.
+El harness añade entradas cuando un agente toma una decisión de arquitectura relevante.
+
+<!-- Nuevas entradas debajo -->
+EOF
+
+seed docs/CONVENTIONS.md <<'EOF'
+# Convenciones
+
+- Metodología: SDD (una feature a la vez, spec aprobado antes de implementar).
+- Ramas: `harness/<feature-name>`.
+- Commits de feature: `feat(<name>): <título>`.
+- Tests obligatorios para cerrar una feature.
+
+## Estilo de código
+
+(añade aquí lo específico del repo)
+EOF
+
+seed spec/README.md <<'EOF'
+# spec/ — Specs aprobados (durables, versionados)
+
+`spec.json` (raíz) es la cola viva. Aquí queda el spec **destilado y aprobado** de cada feature,
+un archivo por feature (`<id>-<name>.md`), generado por `spec.mjs approve`. Es la versión legible
+y trazable: qué se acordó, con qué criterios y por qué.
+EOF
+
+seed progress/README.md <<'EOF'
+# progress/ — Memoria de ejecución
+
+Un archivo por feature (`<id>-<name>.md`) con el registro de cada corrida: intentos, gate que falló,
+tiempo y coste. `LOG.md` es el changelog rodante. Lo genera el orquestador automáticamente.
+
+(`.harness/harness-state.json` es el log crudo por máquina y NO se versiona; esto es el resumen curado que sí.)
+EOF
+
+seed progress/LOG.md <<'EOF'
+# Changelog del harness
+
+EOF
+
 step "Punteros CLAUDE.md / AGENTS.md"
-POINTER=$'# Instrucciones del repo\n\nAntes de actuar, lee `HARNESS.md` y síguelo.\nSi falta el directorio `.harness/`, instálalo siguiendo la sección 4 de `HARNESS.md`.\nNunca implementes una feature cuyo spec no esté aprobado (`spec_approved: true`).\n'
+POINTER=$'# Instrucciones del repo\n\nAntes de actuar, lee `HARNESS.md` y síguelo.\nSi falta el directorio `.harness/`, instálalo siguiendo la sección 4 de `HARNESS.md`.\nLee `docs/` para el contexto del proyecto antes de implementar.\nNunca implementes una feature cuyo spec no esté aprobado (`spec_approved: true`).\n'
 for f in CLAUDE.md AGENTS.md; do
   if [ ! -e "$f" ]; then printf '%s' "$POINTER" > "$f"; say "creado $f";
   elif ! grep -q "HARNESS.md" "$f"; then printf '\n%s' "$POINTER" >> "$f"; say "puntero añadido a $f";
@@ -445,6 +571,7 @@ done
 
 step ".gitignore"
 touch .gitignore
+# docs/ spec/ progress/ se versionan (son la memoria); solo lo efímero se ignora.
 for line in ".harness/harness-state.json" ".harness/interviews/"; do
   grep -qxF "$line" .gitignore || { printf '%s\n' "$line" >> .gitignore; say "añadido: $line"; }
 done
@@ -454,13 +581,14 @@ if node .harness/orchestrator.mjs --dry-run; then :; else warn "El dry-run fall�
 
 cat <<'DONE'
 
-✅ Harness instalado. Próximos pasos:
+✅ Harness + memoria instalados. Próximos pasos:
 
    export HARNESS_AGENT=claude        # o codex
+   # rellena docs/ARCHITECTURE.md y docs/CONVENTIONS.md con el contexto del repo
    node .harness/spec.mjs interview 1 # solo features sdd:true
    node .harness/spec.mjs answer 1
-   node .harness/spec.mjs approve 1
-   node .harness/orchestrator.mjs
+   node .harness/spec.mjs approve 1   # → escribe spec/<id>-<name>.md
+   node .harness/orchestrator.mjs     # → escribe progress/<id>-<name>.md + LOG.md
 
    ⚠️ Córrelo en una branch/worktree aislada (HARNESS_UNATTENDED=1 da escritura sin confirmación).
 DONE
