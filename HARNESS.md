@@ -19,7 +19,7 @@ Dos bucles encadenados sobre un spec SDD (JSON), con una capa de memoria que per
 ```
 FASE 0 — autoría del spec (solo features sdd:true)
   borrador → entrevista (agente ↔ dev) → spec_ready → [APROBACIÓN DEL DEV] ──┐
-                                                       └─→ escribe spec/<id>.md
+                                                       └─→ escribe spec/<id>/{requirements,design,tasks}.md
                                                                              │
 FASE 1 — implementación (solo features aprobadas)                           ▼
   in_progress → agente headless → gates deterministas → review_pending / blocked
@@ -73,7 +73,7 @@ relevantes vuelven a `docs/`.
 | Carpeta | Qué guarda | Quién escribe |
 |---|---|---|
 | `docs/` | Conocimiento durable: `ARCHITECTURE.md`, `DECISIONS.md` (ADR), `CONVENTIONS.md` | el dev y el agente (registra decisiones) |
-| `spec/` | El spec **aprobado y destilado** de cada feature (`<id>-<name>.md`) | `spec.mjs approve` |
+| `spec/` | El spec **aprobado** de cada feature en una subcarpeta `<id>-<name>/` con `requirements.md` (el qué), `design.md` (el cómo) y `tasks.md` (checklist) | `spec.mjs approve` |
 | `progress/` | Memoria de ejecución por feature + `LOG.md` rodante (intentos, gate, TTS, coste) | el orquestador |
 
 Notas de diseño:
@@ -129,7 +129,7 @@ y el CLI del agente elegido (avisa si falta, no aborta). Crea este árbol:
            gates.config.json  harness-state.json(gitignored)  interviews/(gitignored)
 spec.json
 docs/      README ARCHITECTURE DECISIONS CONVENTIONS
-spec/      README + <id>-<name>.md por feature aprobada
+spec/      README + <id>-<name>/{requirements,design,tasks}.md por feature aprobada
 progress/  README LOG.md + <id>-<name>.md por feature implementada
 CLAUDE.md  AGENTS.md   (punteros a este HARNESS.md, auto-cargados por cada agente)
 HARNESS.md
@@ -146,7 +146,7 @@ pending ──(sdd:false)──────────────────�
    │                                                   │
    └─(sdd:true) interview → spec_ready                 │
                               │                         │
-                     [APROBACIÓN] ←─────────────────────┘  spec.mjs approve → spec/<id>.md
+                     [APROBACIÓN] ←─────────────────────┘  spec.mjs approve → spec/<id>/
                               │
                           in_progress  ← orquestador (lee docs/)
                               │
@@ -184,7 +184,7 @@ export HARNESS_AGENT=claude        # o codex
 node .harness/spec.mjs interview 2     # preguntas por dimensión
 #   → responde en .harness/interviews/2.json (campo "answers")
 node .harness/spec.mjs answer 2        # integra + pase adversarial → spec_ready
-node .harness/spec.mjs approve 2       # sella aprobación → escribe spec/2-<name>.md
+node .harness/spec.mjs approve 2       # sella aprobación → escribe spec/2-<name>/ (requirements, design, tasks)
 #   (sdd:false: approve directo, sin interview/answer)
 
 # Fase 1

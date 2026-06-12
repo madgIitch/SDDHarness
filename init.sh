@@ -127,20 +127,43 @@ function feature(spec, id) {
   return f;
 }
 
-// Escribe el spec aprobado y destilado a spec/<id>-<name>.md (memoria durable).
-function writeSpecDoc(f, sc) {
-  mkdirSync(SPECDIR, { recursive: true });
-  const L = [`# ${f.id} · ${f.title}`, ""];
-  L.push(`- **name:** \`${f.name}\``, `- **priority:** ${f.priority ?? "-"}`, `- **sdd:** ${f.sdd === false ? "false" : "true"}`);
-  L.push(`- **aprobado por:** ${f.approved_by} · ${f.approved_at}`);
-  if (f.scope?.length) L.push(`- **scope:** ${f.scope.map((s) => `\`${s}\``).join(", ")}`);
-  L.push("", "## Descripción", "", f.description ?? "");
-  if (f.acceptance?.length) { L.push("", "## Criterios de aceptación", ""); f.acceptance.forEach((a, i) => L.push(`${i + 1}. ${a}`)); }
-  if (sc?.dimensions) { L.push("", "## Cobertura por dimensión", ""); for (const [d, v] of Object.entries(sc.dimensions)) L.push(`- **${d}:** ${v.notes ?? (v.addressed ? "ok" : "—")}`); }
-  if (sc?.answers && Object.keys(sc.answers).length) { L.push("", "## Decisiones de la entrevista", ""); for (const [k, v] of Object.entries(sc.answers)) L.push(`- **${k}:** ${v}`); }
-  const path = `${SPECDIR}/${f.id}-${f.name}.md`;
-  writeFileSync(path, L.join("\n") + "\n");
-  return path;
+// Lista las dimensiones (de un subconjunto) que tengan nota/cobertura.
+function dimList(sc, dims) {
+  if (!sc?.dimensions) return [];
+  return dims
+    .filter((d) => sc.dimensions[d] && (sc.dimensions[d].notes || sc.dimensions[d].addressed))
+    .map((d) => `- **${d}:** ${sc.dimensions[d].notes ?? "ok"}`);
+}
+
+// Escribe el spec aprobado a spec/<id>-<name>/ con requirements.md, design.md y tasks.md.
+function writeSpecFolder(f, sc) {
+  const dir = `${SPECDIR}/${f.id}-${f.name}`;
+  mkdirSync(dir, { recursive: true });
+  const meta = `- name: \`${f.name}\` · priority: ${f.priority ?? "-"} · sdd: ${f.sdd === false ? "false" : "true"}\n- aprobado por: ${f.approved_by} · ${f.approved_at}`;
+
+  // requirements.md — el QUÉ
+  const req = [`# ${f.id} · ${f.title} — Requisitos`, "", meta, "", "## Contexto", "", f.description ?? "", ""];
+  if (f.acceptance?.length) { req.push("## Requisitos funcionales", ""); f.acceptance.forEach((a, i) => req.push(`R${i + 1}. ${a}`)); req.push(""); }
+  const cons = dimList(sc, ["error_states", "auth_secrets", "rollback_compat"]);
+  if (cons.length) req.push("## Restricciones", "", ...cons, "");
+  writeFileSync(`${dir}/requirements.md`, req.join("\n") + "\n");
+
+  // design.md — el CÓMO
+  const des = [`# ${f.id} · ${f.title} — Diseño`, ""];
+  if (f.scope?.length) des.push("## Scope (archivos que puede tocar)", "", ...f.scope.map((s) => `- \`${s}\``), "");
+  const dd = dimList(sc, ["data_model", "external_contracts", "edge_cases", "ui_states"]);
+  if (dd.length) des.push("## Enfoque", "", ...dd, "");
+  if (sc?.answers && Object.keys(sc.answers).length) des.push("## Decisiones de la entrevista", "", ...Object.entries(sc.answers).map(([k, v]) => `- **${k}:** ${v}`), "");
+  writeFileSync(`${dir}/design.md`, des.join("\n") + "\n");
+
+  // tasks.md — el desglose (checklist que el agente marca)
+  const tk = [`# ${f.id} · ${f.title} — Tareas`, "", "Checklist de implementación. El agente marca [x] al completar; los gates verifican.", ""];
+  if (f.acceptance?.length) f.acceptance.forEach((a, i) => tk.push(`- [ ] (T${i + 1}) ${a}  ↔ R${i + 1}`));
+  else tk.push(`- [ ] ${f.description ?? f.title}`);
+  tk.push("- [ ] Tests que cubran los criterios de aceptación");
+  writeFileSync(`${dir}/tasks.md`, tk.join("\n") + "\n");
+
+  return dir;
 }
 
 function interview(id) {
@@ -208,9 +231,9 @@ function approve(id) {
   }
   f.spec_approved = true; f.approved_by = by; f.approved_at = new Date().toISOString();
   saveSpec(spec);
-  const doc = writeSpecDoc(f, sc);
-  tryCommit(`spec.json ${doc}`, `spec: approve #${f.id} ${f.name}`);
-  console.log(`Feature ${id} aprobada por ${by}. Spec durable en ${doc}`);
+  const dir = writeSpecFolder(f, sc);
+  tryCommit(`spec.json ${dir}`, `spec: approve #${f.id} ${f.name}`);
+  console.log(`Feature ${id} aprobada por ${by}. Spec durable en ${dir}/ (requirements, design, tasks)`);
 }
 
 function done(id) {
@@ -370,12 +393,14 @@ export function buildInitialPrompt(task) {
   return [
     "Implementa esta feature (metodología SDD). El spec ya fue aprobado por el dev.",
     "Antes de empezar, lee docs/ARCHITECTURE.md, docs/CONVENTIONS.md y docs/DECISIONS.md si existen, y respétalos.",
+    `Lee el spec completo en spec/${task.id}-${task.name}/ (requirements.md, design.md, tasks.md).`,
     `id: ${task.id}  name: ${task.name}`,
     `Título: ${task.title}`,
     `Descripción: ${task.description}`,
-    task.scope?.length ? `SOLO puedes tocar: ${task.scope.join(", ")} (además de docs/ para registrar decisiones).` : "",
+    task.scope?.length ? `SOLO puedes tocar: ${task.scope.join(", ")} (además de docs/ y spec/ para registrar decisiones y marcar tareas).` : "",
     "Criterios de aceptación:",
     ...(task.acceptance ?? []).map((a, i) => `  ${i + 1}. ${a}`),
+    `Marca [x] en spec/${task.id}-${task.name}/tasks.md las tareas que completes.`,
     "Si tomas una decisión de arquitectura relevante, añádela como entrada nueva en docs/DECISIONS.md.",
     "Reglas: no hagas commits (lo hace el harness), no salgas del scope. Los gates verificarán tu trabajo.",
   ].filter(Boolean).join("\n");
@@ -542,9 +567,14 @@ EOF
 seed spec/README.md <<'EOF'
 # spec/ — Specs aprobados (durables, versionados)
 
-`spec.json` (raíz) es la cola viva. Aquí queda el spec **destilado y aprobado** de cada feature,
-un archivo por feature (`<id>-<name>.md`), generado por `spec.mjs approve`. Es la versión legible
-y trazable: qué se acordó, con qué criterios y por qué.
+`spec.json` (raíz) es la cola viva. Aquí queda el spec **aprobado** de cada feature, en una subcarpeta
+`<id>-<name>/` con tres archivos (estructura SDD):
+
+- `requirements.md` — el QUÉ: contexto, requisitos funcionales (R1, R2…) y restricciones.
+- `design.md` — el CÓMO: scope, enfoque por dimensión y decisiones de la entrevista.
+- `tasks.md` — el desglose: checklist que el agente marca al implementar.
+
+Los genera `spec.mjs approve`.
 EOF
 
 seed progress/README.md <<'EOF'
