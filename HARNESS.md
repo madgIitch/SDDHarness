@@ -23,7 +23,7 @@ FASE 0 — autoría del spec (solo features sdd:true)
                                                                              │
 FASE 1 — implementación (solo features aprobadas)                           ▼
   in_progress → agente headless → gates deterministas → review_pending / blocked
-       │ (lee docs/)                                    └─→ escribe progress/<id>.md
+       │ (lee docs/)                                    └─→ escribe progress/{current,history,impl}.md
        ▲                                                                     │
        └──────────────────────── retry con feedback ─────────────────────────┘
 ```
@@ -32,7 +32,7 @@ Principios no negociables:
 
 1. **El spec se concreta antes de implementar.** Una feature `sdd:true` no llega a implementación sin pasar entrevista + aprobación humana.
 2. **El evaluador es determinista primero.** Un LLM solo juzga criterios blandos, nunca lo que un test puede verificar.
-3. **Una feature a la vez** (`rules.one_feature_at_a_time`). Branch por feature.
+3. **Una feature a la vez** (`rules.one_feature_at_a_time`). Sin ramas por feature: se commitea en sitio sobre la rama actual.
 4. **Presupuesto de fallos.** N intentos por tarea (def. 3), luego `blocked` con contexto. Nunca bucle infinito.
 5. **El humano sigue en el loop** en dos puntos: aprobar el spec y revisar la implementación (`review_pending`).
 6. **Agnóstico de agente.** El mismo bucle corre con Claude o Codex; se elige con `HARNESS_AGENT`.
@@ -45,22 +45,32 @@ Principios no negociables:
 Se elige por variable de entorno (default `claude`). El `runner.mjs` absorbe las diferencias de CLI:
 
 ```bash
-export HARNESS_AGENT=claude   # usa: claude -p ... --output-format json
-export HARNESS_AGENT=codex    # usa: codex exec ...
-export HARNESS_UNATTENDED=1   # ⚠️ desactiva prompts de permiso (solo en branch/worktree aislado)
+export HARNESS_AGENT=claude   # usa: claude -p --output-format json (prompt por stdin)
+export HARNESS_AGENT=codex     # usa: codex exec -s ... -      (prompt por stdin)
+export HARNESS_UNATTENDED=1   # desactiva prompts de permiso (solo en worktree/contenedor aislado)
+
+# Si el CLI no se resuelve (típico en Windows/PowerShell), fija la ruta exacta:
+export HARNESS_CODEX_BIN='C:\ruta\codex.exe'    # o HARNESS_CLAUDE_BIN
+export HARNESS_TIMEOUT_MS=900000                # tope por corrida (def. 15 min)
 ```
 
 | | Claude Code | Codex |
 |---|---|---|
-| Invocación | `claude -p <prompt>` | `codex exec <prompt>` |
+| Invocación | `claude -p --output-format json` | `codex exec -s <sandbox> -` |
+| Prompt | por **stdin** (no como argumento) | por **stdin** (flag `-`) |
 | Salida | objeto JSON (`result`) | mensaje final en stdout |
 | Solo lectura (Fase 0) | `--allowedTools "Read,Grep,Glob"` | `-s read-only` |
 | Escritura (Fase 1) | `--allowedTools "Edit,Write,Bash,..."` | `-s workspace-write` |
 | Sin prompts (unattended) | `--dangerously-skip-permissions` | `--approval-policy never` |
 | Coste por corrida | `total_cost_usd` en el JSON | no se expone → métrica `null` |
 
-El harness debe correr en una **branch/worktree aislada** (o contenedor). En modo unattended el agente
-escribe sin confirmación; nunca lo ejecutes sobre tu rama principal con credenciales de producción ⚠️.
+El prompt se pasa **por stdin** (`spawnSync` con `input`), no como argumento: esto evita problemas de
+comillas y saltos de línea en `cmd.exe`, y al cerrar stdin entrega el EOF que evita el cuelgue conocido de
+`codex exec` cuando lo lanza un proceso hijo no interactivo. En Windows el runner usa `shell:true` para
+resolver los shims `.cmd`/`.exe`; si aun así no encuentra el CLI, fija `HARNESS_CODEX_BIN`/`HARNESS_CLAUDE_BIN`.
+
+Como no usa ramas por feature, si quieres aislar una corrida entera hazlo con un **`git worktree`** o contenedor. En modo unattended el agente
+escribe sin confirmación; aíslalo del entorno con credenciales de producción ⚠️.
 
 ---
 
@@ -74,7 +84,7 @@ relevantes vuelven a `docs/`.
 |---|---|---|
 | `docs/` | Conocimiento durable: `ARCHITECTURE.md`, `DECISIONS.md` (ADR), `CONVENTIONS.md` | el dev y el agente (registra decisiones) |
 | `spec/` | El spec **aprobado** de cada feature en una subcarpeta `<id>-<name>/` con `requirements.md` (el qué), `design.md` (el cómo) y `tasks.md` (checklist) | `spec.mjs approve` |
-| `progress/` | Memoria de ejecución por feature + `LOG.md` rodante (intentos, gate, TTS, coste) | el orquestador |
+| `progress/` | `current.md` (snapshot), `history.md` (historial datado), `impl_<name>.md` (intentos, gate, TTS, coste) y `review_<name>.md` (veredicto + checkpoints) por feature | el orquestador |
 
 Notas de diseño:
 
@@ -105,12 +115,12 @@ Notas de diseño:
 }
 ```
 
-- `sdd: false` → tarea mecánica: sin entrevista, aprobación de un toque, merge automático al pasar gates.
+- `sdd: false` → tarea mecánica: sin entrevista, aprobación de un toque, se cierra a `done` automáticamente al pasar gates.
 - `sdd: true` → pasa por Fase 0 completa y queda en `review_pending` tras implementar.
 
 **Campos que el harness añade** (additivos): `scope` (paths permitidos, lo escribe la entrevista),
 `spec_approved`/`approved_by`/`approved_at` (aprobación), `answers_hash` (invalida la aprobación si el spec
-cambia después). La conversación de la entrevista vive en `.harness/interviews/<id>.json`, no en `spec.json`.
+cambia después). La entrevista vive como Markdown editable en `.harness/interviews/<id>-<name>.md` (el dev responde en líneas `**R:**`), no en `spec.json`.
 
 ---
 
@@ -126,11 +136,11 @@ y el CLI del agente elegido (avisa si falta, no aborta). Crea este árbol:
 
 ```
 .harness/  runner.mjs orchestrator.mjs spec.mjs gates.mjs prompt.mjs state.mjs
-           gates.config.json  harness-state.json(gitignored)  interviews/(gitignored)
+           interview.mjs gates.config.json  harness-state.json(gitignored)  interviews/(gitignored, .md)
 spec.json
 docs/      README ARCHITECTURE DECISIONS CONVENTIONS
 spec/      README + <id>-<name>/{requirements,design,tasks}.md por feature aprobada
-progress/  README LOG.md + <id>-<name>.md por feature implementada
+progress/  README current.md history.md + impl_<name>.md y review_<name>.md por feature
 CLAUDE.md  AGENTS.md   (punteros a este HARNESS.md, auto-cargados por cada agente)
 HARNESS.md
 ```
@@ -153,11 +163,12 @@ pending ──(sdd:false)──────────────────�
                   ┌───────────┴───────────┐
               gates pass                N fallos
                   │                         │
-        (sdd:false) done            (sdd:true) review_pending → done   blocked
-                              (cada cierre → progress/<id>.md + LOG.md)
+   commit feat() en la rama actual (intento fallido → reset --hard + clean)
+        (sdd:false) done            (sdd:true) review_pending ──done──▶  blocked
+                              (cada cierre → current · history · impl_<name> · review_<name>)
 ```
 
-`blocked` es escalada: el dev revisa el último `failureOutput` en `progress/<id>.md` o
+`blocked` es escalada: el dev revisa el último `failureOutput` en `progress/impl_<name>.md` o
 `harness-state.json`, ajusta el spec o el repo, y vuelve a poner la feature en cola.
 
 ---
@@ -181,8 +192,8 @@ harness verifica. El forcing de preguntas no se basa en pedirlas (eso da relleno
 export HARNESS_AGENT=claude        # o codex
 
 # Fase 0 (solo sdd:true)
-node .harness/spec.mjs interview 2     # preguntas por dimensión
-#   → responde en .harness/interviews/2.json (campo "answers")
+node .harness/spec.mjs interview 2     # escribe interviews/2-<name>.md con preguntas
+#   responde los **R:** en ese .md
 node .harness/spec.mjs answer 2        # integra + pase adversarial → spec_ready
 node .harness/spec.mjs approve 2       # sella aprobación → escribe spec/2-<name>/ (requirements, design, tasks)
 #   (sdd:false: approve directo, sin interview/answer)
@@ -190,7 +201,7 @@ node .harness/spec.mjs approve 2       # sella aprobación → escribe spec/2-<n
 # Fase 1
 node .harness/orchestrator.mjs --dry-run
 node .harness/orchestrator.mjs         # implementa, corre gates, escribe progress/
-node .harness/spec.mjs done 2          # tras revisar la branch harness/<name>
+node .harness/spec.mjs done 2          # tras revisar el diff del commit feat(<name>)
 ```
 
 El agente que implementa: trabaja solo sobre la tarea asignada y dentro del `scope` (+ `docs/`), sin commits
@@ -230,7 +241,7 @@ coste agregado y qué gate falla más.
 - El LLM-as-judge (si lo añades como gate no bloqueante) **no está validado** contra juicio humano. Revisa una muestra de sus veredictos periódicamente.
 - `diff-scope` solo sirve si el `scope` está bien acotado. Un scope demasiado amplio lo vuelve inútil.
 - La ejecución es secuencial (`one_feature_at_a_time`). Para features que tocan contratos compartidos, secuéncialas: no las apruebes a la vez.
-- El harness asume una branch/worktree aislada. En modo unattended el agente escribe sin confirmación ⚠️.
+- En modo unattended el agente escribe sin confirmación: aísla la corrida en un `git worktree` o contenedor ⚠️.
 
 ---
 
