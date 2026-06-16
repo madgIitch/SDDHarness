@@ -178,11 +178,10 @@ pending ──(sdd:false)──────────────────�
 La entrevista es una invocación **de solo lectura** que no edita código; produce salida estructurada que el
 harness verifica. El forcing de preguntas no se basa en pedirlas (eso da relleno), sino en dos mecanismos:
 
-1. **Cobertura por dimensiones.** Para cada dimensión [`data_model`, `error_states`, `edge_cases`, `auth_secrets`, `external_contracts`, `ui_states`, `rollback_compat`, `tests`] el agente la resuelve o levanta una pregunta. El harness rechaza el spec si queda alguna sin cubrir.
-2. **Pase adversarial de implementador.** Una segunda invocación lista cada punto donde un implementador tendría que adivinar. Esos puntos se vuelven preguntas. Atrapa la sobreconfianza del modelo que redacta.
+1. **Cobertura por dimensiones.** Para cada dimensión [`data_model`, `error_states`, `edge_cases`, `auth_secrets`, `external_contracts`, `ui_states`, `rollback_compat`, `tests`] el agente la resuelve o levanta una pregunta. El harness rechaza el spec si queda alguna sin cubrir. Si el agente omite una dimensión, el harness la trata como no cubierta.
+2. **Pase adversarial de implementador.** Una segunda invocación —que recibe tus respuestas y la cobertura— lista los puntos donde un implementador todavía tendría que tomar una decisión material. Se anotan como **suposiciones** en el `.md` (sección "Suposiciones del implementador"), para revisarlas antes de aprobar.
 
-`ready: true` requiere cobertura completa **y** cero adivinanzas. La aprobación es del dev, auditada con
-`answers_hash` (si editas las respuestas después, la aprobación se invalida sola).
+La readiness (`spec_ready`) se decide **solo por la cobertura de las 8 dimensiones**. Las suposiciones del pase adversarial son avisos, no bloquean: las ves antes de aprobar y decides si ajustas el spec. La aprobación es del dev, auditada con `answers_hash` (si editas las respuestas después, la aprobación se invalida sola).
 
 ---
 
@@ -236,7 +235,7 @@ coste agregado y qué gate falla más.
 
 ## 11. Límites conocidos
 
-- La confianza autorreportada del modelo es señal débil. Los gates reales de la entrevista son la **cobertura de dimensiones** y el **pase adversarial**, no un score.
+- La confianza autorreportada del modelo es señal débil. El gate real de la entrevista es la **cobertura de dimensiones**; el **pase adversarial** es un aviso para revisar antes de aprobar, no un score.
 - El coste por corrida solo se mide con Claude (Codex no lo expone en stdout; habría que parsear el rollout JSONL de la sesión).
 - El LLM-as-judge (si lo añades como gate no bloqueante) **no está validado** contra juicio humano. Revisa una muestra de sus veredictos periódicamente.
 - `diff-scope` solo sirve si el `scope` está bien acotado. Un scope demasiado amplio lo vuelve inútil.
