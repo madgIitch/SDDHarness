@@ -113,6 +113,13 @@ import { createHash } from "node:crypto";
 const IDIR = ".harness/interviews";
 export const interviewPath = (f) => `${IDIR}/${f.id}-${f.name}.md`;
 export const answersHash = (answers) => "sha256:" + createHash("sha256").update(JSON.stringify(answers)).digest("hex");
+const stableKey = (prefix, text) => `${prefix}-${createHash("sha1").update(String(text)).digest("hex").slice(0, 10)}`;
+
+function normalizeList(v) {
+  if (Array.isArray(v)) return v.map((x) => String(x).trim()).filter(Boolean);
+  if (!v) return [];
+  return String(v).split(/\n/).map((s) => s.replace(/^[-*]\s*/, "").trim()).filter(Boolean);
+}
 
 // Extrae { dim/clave: respuesta } de los bloques "### [clave] ...\n**R:** ...".
 export function parseAnswers(md) {
@@ -144,7 +151,8 @@ export function renderInterview(f, res, priorAnswers = {}, guesses = []) {
   const dims = res.dimensions || {};
   const open = Object.keys(dims).filter((d) => !dims[d].addressed);
   const ready = open.length === 0; // readiness = SOLO cobertura de dimensiones (los guesses no bloquean)
-  const L = [`# Entrevista · ${f.id} · ${f.title}`, "", `- name: \`${f.name}\``];
+  const title = f.title ?? f.name ?? f.id;
+  const L = [`# Entrevista · ${f.id} · ${title}`, "", `- name: \`${f.name ?? title}\``];
   L.push(ready ? `- estado: **dimensiones cubiertas** → aprueba con \`spec.mjs approve ${f.id}\``
                : `- estado: responde los **R:** y corre \`spec.mjs answer ${f.id}\``, "");
   if (open.length) {
@@ -153,7 +161,10 @@ export function renderInterview(f, res, priorAnswers = {}, guesses = []) {
   }
   if (guesses.length) {
     L.push("## Suposiciones del implementador", "", "> No bloquean la aprobación, pero conviene revisarlas. Puedes responder en su `**R:**` para fijarlas en el diseño.", "");
-    guesses.forEach((g, i) => L.push(`### [adv${i + 1}] ${g}`, "", `**R:** ${priorAnswers["adv" + (i + 1)] ?? ""}`, ""));
+    guesses.forEach((g) => {
+      const key = stableKey("adv", g);
+      L.push(`### [${key}] ${g}`, "", `**R:** ${priorAnswers[key] ?? ""}`, "");
+    });
   }
   if (ready) {
     const recorded = Object.entries(priorAnswers).filter(([k]) => !k.startsWith("adv"));
@@ -161,8 +172,8 @@ export function renderInterview(f, res, priorAnswers = {}, guesses = []) {
   }
   L.push("## Cobertura de dimensiones", "");
   for (const [d, v] of Object.entries(dims)) L.push(`- ${v.addressed ? "✅" : "❓"} ${d} — ${v.notes || (v.addressed ? "ok" : "pendiente")}`);
-  L.push("", "## Scope propuesto", "", ...(res.scope || []).map((s) => `- \`${s}\``), "");
-  L.push("## Acceptance propuesto", "", ...(res.acceptance || []).map((a, i) => `${i + 1}. ${a}`), "");
+  L.push("", "## Scope propuesto", "", ...normalizeList(res.scope).map((s) => `- \`${s}\``), "");
+  L.push("## Acceptance propuesto", "", ...normalizeList(res.acceptance).map((a, i) => `${i + 1}. ${a}`), "");
   return L.join("\n") + "\n";
 }
 INTERVIEW_EOF
@@ -184,8 +195,61 @@ const DIMENSIONS = [
 const sh = (cmd) => execSync(cmd, { stdio: "pipe", encoding: "utf8" });
 const tryCommit = (paths, msg) => { try { sh(`git add ${paths}`); sh(`git commit -q -m ${JSON.stringify(msg)} -- ${paths}`); } catch {} };
 const loadSpec = () => JSON.parse(readFileSync(SPEC, "utf8"));
-const saveSpec = (s) => writeFileSync(SPEC, JSON.stringify(s, null, 2));
+const saveSpec = (s) => writeFileSync(SPEC, JSON.stringify(s, null, 2) + "\n");
 const ask = (prompt) => extractJson(runAgent(prompt, { write: false }).text);
+
+function normalizeList(v) {
+  if (Array.isArray(v)) return v.map((x) => String(x).trim()).filter(Boolean);
+  if (!v) return [];
+  return String(v).split(/\n/).map((s) => s.replace(/^[-*]\s*/, "").trim()).filter(Boolean);
+}
+
+function parseNumberedSection(md, heading) {
+  if (!md) return [];
+  const section = (md.split(`## ${heading}`)[1] || "").split("\n## ")[0];
+  const items = [];
+  let current = null;
+  for (const rawLine of section.split("\n")) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const numbered = line.match(/^\d+\.\s+(.*)$/);
+    if (numbered) {
+      if (current) items.push(current.trim());
+      current = numbered[1];
+    } else if (current) {
+      current += ` ${line}`;
+    }
+  }
+  if (current) items.push(current.trim());
+  return items;
+}
+
+function parseScopeSection(md) {
+  if (!md) return [];
+  const section = (md.split("## Scope propuesto")[1] || "").split("\n## ")[0];
+  return section.split("\n")
+    .map((l) => l.trim().match(/^-\s+`?([^`]+)`?$/)?.[1]?.trim())
+    .filter(Boolean);
+}
+
+function normalizeGuesses(v) {
+  const guesses = Array.isArray(v) ? v : (v ? [v] : []);
+  return guesses.map((g) => {
+    if (typeof g === "string") return g;
+    if (g && typeof g === "object") {
+      const vals = ["question", "point", "text", "reason"].map((k) => g[k]).filter((x) => typeof x === "string" && x.trim());
+      return vals.length ? vals.join(" — ") : JSON.stringify(g);
+    }
+    return String(g);
+  }).map((s) => s.replace(/\s+/g, " ").trim()).filter(Boolean);
+}
+
+// Garantiza que las 8 dimensiones existan (un dim ausente = sin cubrir, con pregunta).
+function fillDims(dims = {}) {
+  const out = {};
+  for (const d of DIMENSIONS) out[d] = dims[d] ?? { addressed: false, question: "Aclara esta dimensión (el agente no la cubrió)." };
+  return out;
+}
 
 function feature(spec, id) {
   const f = spec.features.find((x) => String(x.id) === String(id));
@@ -246,58 +310,45 @@ function interview(id) {
   else { console.log(`Entrevista en ${interviewPath(f)} — preguntas abiertas:`); open.forEach((d) => console.log(`  [${d}] ${res.dimensions[d].question}`)); console.log(`Responde los **R:** y corre: spec.mjs answer ${id}`); }
 }
 
-// Normaliza un "guess" a una sola línea de texto, sea string u objeto ({point,reason}, etc.).
-function normGuess(g) {
-  let s;
-  if (typeof g === "string") s = g;
-  else if (g && typeof g === "object") {
-    const vals = Object.values(g).filter((v) => typeof v === "string" && v.trim());
-    s = vals.length ? vals.join(" — ") : JSON.stringify(g);
-  } else s = String(g);
-  return s.replace(/\s+/g, " ").trim();
-}
-// Garantiza que las 8 dimensiones existan (un dim ausente = sin cubrir, con pregunta).
-function fillDims(dims = {}) {
-  const out = {};
-  for (const d of DIMENSIONS) out[d] = dims[d] ?? { addressed: false, question: "Aclara esta dimensión (el agente no la cubrió)." };
-  return out;
-}
-
 function answer(id) {
   const spec = loadSpec();
   const f = feature(spec, id);
   const prior = readInterview(f);
+  const existingAC = parseNumberedSection(prior.md, "Acceptance propuesto");
+  const existingScope = parseScopeSection(prior.md);
   const revised = ask([
     "Revisa esta spec integrando las respuestas del dev. NO escribas código. Devuelve SOLO JSON (mismo formato).",
     `Feature: ${JSON.stringify({ id: f.id, title: f.title, description: f.description })}`,
     `Cobertura previa: ${JSON.stringify(prior.dimensions)}`,
     `Respuestas del dev: ${JSON.stringify(prior.answers)}`,
-    `Dimensiones: [${DIMENSIONS.join(", ")}]. Marca addressed:true en las que las respuestas dejen resueltas.`,
-    'Formato EXACTO: {"dimensions":{"<dim>":{"addressed":bool,"notes":"...","question":"...si false"}},"scope":[],"acceptance":[]}',
-  ].join("\n"));
+    existingAC.length
+      ? `Criterios de aceptación existentes (presérvalos salvo que una respuesta del dev los vuelva más precisos): ${JSON.stringify(existingAC)}`
+      : "",
+    existingScope.length
+      ? `Scope existente (presérvalo salvo contradicción explícita): ${JSON.stringify(existingScope)}`
+      : "",
+    `Dimensiones: [${DIMENSIONS.join(", ")}]. Mismo formato JSON con dimensions/scope/acceptance.`,
+  ].filter(Boolean).join("\n"));
   revised.dimensions = fillDims(revised.dimensions);
-
-  // Pase adversarial: recibe TODO el contexto (respuestas + cobertura), no solo scope/acceptance.
+  const finalAcceptance = existingAC.length ? existingAC : normalizeList(revised.acceptance);
+  const finalScope = existingScope.length ? existingScope : normalizeList(revised.scope);
   const adv = ask([
-    "Eres el implementador que va a programar esto. Con la spec Y las respuestas del dev, lista SOLO los puntos que aún te obligarían a tomar una decisión de implementación MATERIAL por tu cuenta.",
-    "No incluyas nitpicks ni cosas ya resueltas por las respuestas. Si la spec es implementable, devuelve guesses vacío.",
-    `Spec: ${JSON.stringify({ scope: revised.scope, acceptance: revised.acceptance })}`,
-    `Cobertura: ${JSON.stringify(revised.dimensions)}`,
-    `Respuestas del dev: ${JSON.stringify(prior.answers)}`,
-    'Formato EXACTO: {"guesses":["frase corta",...]} — cada elemento es UNA cadena, nunca un objeto. Vacío si no hay ninguno.',
+    "Eres QA de criterios de aceptación. Lista SOLO ambigüedades bloqueantes: casos donde no se puede decidir si el sistema PASA o FALLA sin una decisión de negocio adicional.",
+    "NO reportes detalles internos de implementación, testIDs, props de componentes, librerías, estructura de carpetas ni configuración de CI si no cambian el comportamiento observable.",
+    "SÍ reporta umbrales indefinidos, endpoints/rutas no especificadas, campos de request/response faltantes y comportamientos observables donde dos implementaciones razonables darían resultados distintos.",
+    `Spec: ${JSON.stringify({ scope: finalScope, acceptance: finalAcceptance })}`,
+    'Formato: {"guesses":["string"]} (vacío si no hay ninguno).',
   ].join("\n"));
-  const guesses = (adv.guesses ?? []).map(normGuess).filter(Boolean);
-
-  // Readiness = SOLO cobertura de dimensiones. Los guesses son avisos, no bloquean.
+  const guesses = normalizeGuesses(adv.guesses);
   const ready = DIMENSIONS.every((d) => revised.dimensions[d].addressed === true);
-  writeInterview(f, renderInterview(f, revised, prior.answers, guesses));
+  writeInterview(f, renderInterview(f, { ...revised, scope: finalScope, acceptance: finalAcceptance }, prior.answers, guesses));
   if (!ready) {
     console.log(`Feature ${id} aún NO está lista — dimensiones sin cubrir:`);
     DIMENSIONS.filter((d) => !revised.dimensions[d].addressed).forEach((d) => console.log(`  [${d}] ${revised.dimensions[d].question ?? ""}`));
     if (guesses.length) console.log(`(${guesses.length} suposición(es) del implementador anotadas en el .md)`);
     return;
   }
-  f.acceptance = revised.acceptance; f.scope = revised.scope; f.status = "spec_ready";
+  f.acceptance = finalAcceptance; f.scope = finalScope; f.status = "spec_ready";
   saveSpec(spec);
   console.log(`Feature ${id} → spec_ready (dimensiones cubiertas).`);
   if (guesses.length) { console.log("⚠️  Suposiciones del implementador a revisar antes de approve:"); guesses.forEach((g) => console.log(`  - ${g}`)); }

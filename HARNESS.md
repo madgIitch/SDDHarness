@@ -179,9 +179,21 @@ La entrevista es una invocación **de solo lectura** que no edita código; produ
 harness verifica. El forcing de preguntas no se basa en pedirlas (eso da relleno), sino en dos mecanismos:
 
 1. **Cobertura por dimensiones.** Para cada dimensión [`data_model`, `error_states`, `edge_cases`, `auth_secrets`, `external_contracts`, `ui_states`, `rollback_compat`, `tests`] el agente la resuelve o levanta una pregunta. El harness rechaza el spec si queda alguna sin cubrir. Si el agente omite una dimensión, el harness la trata como no cubierta.
-2. **Pase adversarial de implementador.** Una segunda invocación —que recibe tus respuestas y la cobertura— lista los puntos donde un implementador todavía tendría que tomar una decisión material. Se anotan como **suposiciones** en el `.md` (sección "Suposiciones del implementador"), para revisarlas antes de aprobar.
+2. **Pase adversarial de implementador.** Una segunda invocación —que recibe tus respuestas, el scope y los criterios de aceptación estabilizados— lista los puntos donde un implementador todavía tendría que tomar una decisión material. Se anotan como **suposiciones** en el `.md` (sección "Suposiciones del implementador"), para revisarlas antes de aprobar.
 
-La readiness (`spec_ready`) se decide **solo por la cobertura de las 8 dimensiones**. Las suposiciones del pase adversarial son avisos, no bloquean: las ves antes de aprobar y decides si ajustas el spec. La aprobación es del dev, auditada con `answers_hash` (si editas las respuestas después, la aprobación se invalida sola).
+La readiness (`spec_ready`) se decide **solo por la cobertura de las 8 dimensiones**. Las suposiciones del
+pase adversarial son avisos, no bloquean: las ves antes de aprobar y decides si ajustas el spec. La aprobación
+es del dev, auditada con `answers_hash` (si editas las respuestas después, la aprobación se invalida sola).
+
+Detalles operativos importantes:
+
+- El Markdown de entrevista es la fuente editable entre rondas. `answer` preserva el `Scope propuesto` y el
+  `Acceptance propuesto` ya escritos, y solo usa la salida nueva del agente como fallback o refinamiento.
+- Las suposiciones adversariales usan claves estables derivadas del texto, no `adv1`, `adv2`, etc.
+  Así una respuesta anterior no se pega por error a una pregunta distinta si el pase adversarial cambia de orden.
+- Las listas `scope`, `acceptance` y `guesses` se normalizan defensivamente. Si el agente devuelve strings u
+  objetos en lugar de arrays, el harness no rompe con `TypeError`, no parte criterios por comas y no imprime
+  `[object Object]` como ambigüedad.
 
 ---
 
