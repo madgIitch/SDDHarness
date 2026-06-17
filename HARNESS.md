@@ -194,6 +194,10 @@ Detalles operativos importantes:
 - Las listas `scope`, `acceptance` y `guesses` se normalizan defensivamente. Si el agente devuelve strings u
   objetos en lugar de arrays, el harness no rompe con `TypeError`, no parte criterios por comas y no imprime
   `[object Object]` como ambigüedad.
+- Si el dev decide que la entrevista ya es suficiente aunque queden suposiciones o el modelo siga insistiendo,
+  puede ejecutar `node .harness/spec.mjs force-ready <id>`. Esta orden toma el `Scope propuesto` y el
+  `Acceptance propuesto` actuales del Markdown, marca la feature como `spec_ready` y deja metadatos de override.
+  No aprueba la feature: después sigue siendo necesario ejecutar `approve`.
 
 ---
 
@@ -206,6 +210,7 @@ export HARNESS_AGENT=claude        # o codex
 node .harness/spec.mjs interview 2     # escribe interviews/2-<name>.md con preguntas
 #   responde los **R:** en ese .md
 node .harness/spec.mjs answer 2        # integra + pase adversarial → spec_ready
+node .harness/spec.mjs force-ready 2   # override manual si Fase 0 no converge pero el dev decide avanzar
 node .harness/spec.mjs approve 2       # sella aprobación → escribe spec/2-<name>/ (requirements, design, tasks)
 #   (sdd:false: approve directo, sin interview/answer)
 

@@ -355,6 +355,25 @@ function answer(id) {
   console.log(`Aprueba con: spec.mjs approve ${id}`);
 }
 
+function forceReady(id) {
+  const spec = loadSpec();
+  const f = feature(spec, id);
+  if (f.sdd === false) { console.log(`Feature ${id} es sdd:false; usa approve directo.`); return; }
+  const prior = readInterview(f);
+  const acceptance = parseNumberedSection(prior.md, "Acceptance propuesto");
+  const scope = parseScopeSection(prior.md);
+  if (!acceptance.length) throw new Error(`No hay "Acceptance propuesto" en ${interviewPath(f)}. Edita la entrevista o corre answer antes de force-ready.`);
+  if (!scope.length) throw new Error(`No hay "Scope propuesto" en ${interviewPath(f)}. Edita la entrevista o corre answer antes de force-ready.`);
+  f.acceptance = acceptance;
+  f.scope = scope;
+  f.status = "spec_ready";
+  f.manual_spec_ready = true;
+  f.manual_spec_ready_at = new Date().toISOString();
+  f.manual_spec_ready_reason = "Dev override: Fase 0 marcada como suficientemente especificada pese a suposiciones pendientes.";
+  saveSpec(spec);
+  console.log(`Feature ${id} → spec_ready por override manual. Revisa y aprueba: spec.mjs approve ${id}`);
+}
+
 function approve(id) {
   const spec = loadSpec();
   const f = feature(spec, id);
@@ -382,8 +401,8 @@ function done(id) {
 }
 
 const [cmd, id] = process.argv.slice(2);
-const cmds = { interview, answer, approve, done };
-if (!cmds[cmd] || !id) { console.log("Uso: node .harness/spec.mjs <interview|answer|approve|done> <id>"); process.exit(1); }
+const cmds = { interview, answer, "force-ready": forceReady, approve, done };
+if (!cmds[cmd] || !id) { console.log("Uso: node .harness/spec.mjs <interview|answer|force-ready|approve|done> <id>"); process.exit(1); }
 cmds[cmd](id);
 SPEC_EOF
 
