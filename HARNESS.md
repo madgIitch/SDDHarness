@@ -61,7 +61,7 @@ export HARNESS_TIMEOUT_MS=900000                # tope por corrida (def. 15 min)
 | Salida | objeto JSON (`result`) | mensaje final en stdout |
 | Solo lectura (Fase 0) | `--allowedTools "Read,Grep,Glob"` | `-s read-only` |
 | Escritura (Fase 1) | `--allowedTools "Edit,Write,Bash,..."` | `-s workspace-write` |
-| Sin prompts (unattended) | `--dangerously-skip-permissions` | `--approval-policy never` |
+| Sin prompts (unattended) | `--dangerously-skip-permissions` | `-c approval_policy='never'` |
 | Coste por corrida | `total_cost_usd` en el JSON | no se expone → métrica `null` |
 
 El prompt se pasa **por stdin** (`spawnSync` con `input`), no como argumento: esto evita problemas de
@@ -82,13 +82,15 @@ relevantes vuelven a `docs/`.
 
 | Carpeta | Qué guarda | Quién escribe |
 |---|---|---|
-| `docs/` | Conocimiento durable: `ARCHITECTURE.md`, `DECISIONS.md` (ADR), `CONVENTIONS.md` | el dev y el agente (registra decisiones) |
+| `docs/` | Conocimiento durable: `ARCHITECTURE.md`, `DECISIONS.md` (ADR), `CONVENTIONS.md` | el dev, `spec.mjs approve` y el agente (registra decisiones) |
 | `spec/` | El spec **aprobado** de cada feature en una subcarpeta `<id>-<name>/` con `requirements.md` (el qué), `design.md` (el cómo) y `tasks.md` (checklist) | `spec.mjs approve` |
 | `progress/` | `current.md` (snapshot), `history.md` (historial datado), `impl_<name>.md` (intentos, gate, TTS, coste) y `review_<name>.md` (veredicto + checkpoints) por feature | el orquestador |
 
 Notas de diseño:
 
-- El gate `diff-scope` lleva `docs/`, `spec/` y `progress/` en una **allowlist permanente**: sin ella, el agente fallaría la feature al registrar una decisión en `docs/DECISIONS.md`.
+- El gate `diff-scope` lleva `docs/`, `spec/`, `progress/` y `.harness/` en una **allowlist permanente**: sin ella, el agente fallaría la feature al registrar una decisión en `docs/DECISIONS.md` o al ajustar el propio harness.
+- El `scope` puede usar sufijos glob simples (`*`, `/**`, `/**/*`); el gate los normaliza a prefijos de ruta y desescapa paths entrecomillados por git antes de comparar.
+- `spec.mjs approve` anexa contexto mínimo a `docs/ARCHITECTURE.md` y `docs/DECISIONS.md` usando el spec aprobado y las dimensiones de la entrevista. Esto evita que `docs/` quede como plantilla vacía si el dev no la rellena a mano.
 - Los commits de memoria son **path-limited** (`git commit -- progress`), así que no arrastran cambios a medias en otros archivos.
 - `.harness/harness-state.json` (log crudo por máquina) y los sidecars de entrevista **no** se versionan; la memoria curada (`docs/spec/progress`) **sí**.
 
@@ -145,7 +147,8 @@ CLAUDE.md  AGENTS.md   (punteros a este HARNESS.md, auto-cargados por cada agent
 HARNESS.md
 ```
 
-Tras instalar: rellena `docs/ARCHITECTURE.md` y `docs/CONVENTIONS.md` con el contexto del repo.
+Tras instalar: rellena `docs/ARCHITECTURE.md` y `docs/CONVENTIONS.md` con el contexto del repo. Aunque no lo
+hagas, cada `spec.mjs approve` anexará memoria mínima en `docs/` para que el siguiente agente no parta de cero.
 
 ---
 
@@ -256,6 +259,7 @@ coste agregado y qué gate falla más.
 - El coste por corrida solo se mide con Claude (Codex no lo expone en stdout; habría que parsear el rollout JSONL de la sesión).
 - El LLM-as-judge (si lo añades como gate no bloqueante) **no está validado** contra juicio humano. Revisa una muestra de sus veredictos periódicamente.
 - `diff-scope` solo sirve si el `scope` está bien acotado. Un scope demasiado amplio lo vuelve inútil.
+- Si la última tentativa falla, el orquestador conserva sus cambios para facilitar la inspección manual; solo limpia entre reintentos.
 - La ejecución es secuencial (`one_feature_at_a_time`). Para features que tocan contratos compartidos, secuéncialas: no las apruebes a la vez.
 - En modo unattended el agente escribe sin confirmación: aísla la corrida en un `git worktree` o contenedor ⚠️.
 

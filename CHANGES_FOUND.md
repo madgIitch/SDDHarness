@@ -38,6 +38,29 @@ Este documento resume los problemas detectados durante la corrida del harness en
    - Si el dev ya revisó el Markdown y decide asumir el riesgo, el harness debe permitir pasar a `spec_ready` sin pelearse con el modelo.
    - Riesgo si no existe esta salida: el proceso queda bloqueado por criterio del LLM aunque el responsable humano ya haya tomado una decisión.
 
+8. Los archivos de `docs/` rara vez se rellenan
+   - Las plantillas iniciales eran demasiado genéricas y no había un punto del flujo que escribiera memoria durable automáticamente.
+   - Aunque el agente debía leer `docs/`, no había garantía de que `ARCHITECTURE.md` o `DECISIONS.md` contuvieran información real.
+   - Riesgo: cada corrida vuelve a redescubrir contexto y decisiones que ya estaban en la entrevista o en el spec aprobado.
+
+9. La flag de aprobación de Codex cambió
+   - El runner usaba `codex exec ... --approval-policy never`.
+   - En el proyecto destino se corrigió a `codex exec ... -c approval_policy='never'`.
+   - Riesgo: si la CLI actual de Codex no acepta la flag antigua, el harness falla al intentar ejecutar Codex sin prompts.
+
+10. El orquestador borraba demasiada información útil al fallar
+   - En cada intento fallido hacía `git reset --hard` y `git clean`, incluido el último intento.
+   - Si el agente dejaba una implementación parcialmente útil, se perdía justo cuando el dev necesitaba inspeccionarla.
+   - También podía fallar al commitear si el propio agente ya había dejado un commit válido.
+   - Riesgo: se pierde diagnóstico y el harness marca como fallo un estado que ya estaba persistido.
+
+11. `diff-scope` no entendía scopes con glob ni cambios del propio harness
+   - Algunos specs usan rutas como `packages/mobile/**/*` o `supabase/functions/*`.
+   - El gate comparaba con `startsWith` literal, así que esos scopes no coincidían con archivos reales.
+   - En rutas con espacios o caracteres especiales, `git status --porcelain` puede devolver paths entrecomillados.
+   - `.harness/` tampoco estaba en la allowlist permanente, bloqueando migraciones o fixes del harness.
+   - Riesgo: el gate falla aunque los cambios estén dentro del scope previsto.
+
 ## Cambios propuestos
 
 1. Normalización defensiva de listas
@@ -75,10 +98,34 @@ Este documento resume los problemas detectados durante la corrida del harness en
    - Marca la feature como `spec_ready` con metadatos de override manual.
    - No aprueba ni implementa: mantiene el paso humano posterior de `approve`.
 
+8. Alimentar `docs/` durante `approve`
+   - `spec.mjs approve` anexa una entrada por feature a `docs/ARCHITECTURE.md`.
+   - También anexa una entrada ADR resumida a `docs/DECISIONS.md`.
+   - Las entradas usan marcadores `<!-- harness:<id> -->` para no duplicarse si se repite `approve`.
+   - Las plantillas iniciales de `docs/` ahora piden datos concretos: objetivo, usuarios, componentes, integraciones, comandos, tests y despliegue.
+
+9. Actualizar `runCodex`
+   - El runner generado por `init.sh` ahora pasa la política de aprobación con `-c approval_policy='never'`.
+   - Se mantiene el comportamiento: en modo escritura o unattended, Codex no debe pedir aprobación interactiva.
+
+10. Preservar el último intento fallido
+   - El orquestador solo limpia el working tree entre reintentos.
+   - En el último fallo deja los archivos en disco para revisión manual.
+   - Si `git commit` responde `nothing to commit`, se acepta como éxito cuando el agente ya dejó el commit.
+
+11. Mejorar `diff-scope`
+   - `.harness/` entra en la allowlist permanente junto a `docs/`, `spec/` y `progress/`.
+   - Los sufijos glob simples (`*`, `/**`, `/**/*`) se normalizan a prefijos antes de comparar rutas.
+   - Las rutas entrecomilladas por `git status --porcelain` se desescapan antes de validar scope.
+
 ## Resultado esperado
 
 - La Fase 0 deja de romperse por variaciones normales de salida del LLM.
 - El Markdown de entrevista sigue siendo editable y estable entre rondas.
 - El dev puede revisar suposiciones adversariales sin que bloqueen indefinidamente.
 - Si el modelo no converge, el dev puede avanzar explícitamente con `force-ready` sin saltarse la aprobación.
+- `docs/` deja de depender solo de disciplina manual: cada spec aprobado deja memoria mínima reusable.
+- El runner queda alineado con la forma actual de configurar `codex exec`.
+- Los últimos intentos fallidos quedan disponibles para inspección en vez de destruirse automáticamente.
+- `diff-scope` acepta patrones de scope habituales y no bloquea cambios legítimos del harness.
 - Los specs aprobados salen de una base más fiable y menos propensa a ciclos artificiales.

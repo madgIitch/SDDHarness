@@ -91,7 +91,7 @@ function runClaude(prompt, write) {
 function runCodex(prompt, write) {
   const sandbox = write ? "workspace-write" : "read-only";
   const args = ["exec", "-s", sandbox];
-  if (UNATTENDED || write) args.push("--approval-policy", "never");
+  if (UNATTENDED || write) args.push("-c", "approval_policy='never'");
   args.push("-"); // '-' = leer el prompt completo desde stdin
   return { text: exec("codex", args, prompt).trim(), cost: null };
 }
@@ -289,6 +289,46 @@ function writeSpecFolder(f, intv) {
   return dir;
 }
 
+function appendOnce(path, marker, lines) {
+  mkdirSync("docs", { recursive: true });
+  const current = existsSync(path) ? readFileSync(path, "utf8") : "";
+  if (current.includes(marker)) return;
+  writeFileSync(path, `${current.trimEnd()}\n\n${lines.join("\n")}\n`);
+}
+
+// Alimenta docs/ con contexto durable al aprobar specs. Esto evita que docs/ quede
+// como placeholder eterno y convierte cada aprobación en memoria reutilizable.
+function writeDocsFromSpec(f, intv) {
+  const marker = `<!-- harness:${f.id} -->`;
+  const title = f.title ?? f.name ?? f.id;
+  const scope = (f.scope ?? []).map((s) => `  - \`${s}\``);
+  const approach = dimList(intv, ["data_model", "external_contracts", "edge_cases", "ui_states"]);
+  appendOnce("docs/ARCHITECTURE.md", marker, [
+    marker,
+    `## ${f.id} · ${title}`,
+    "",
+    f.description ?? "",
+    "",
+    "### Scope aprobado",
+    "",
+    ...(scope.length ? scope : ["  - (sin scope declarado)"]),
+    "",
+    ...(approach.length ? ["### Contexto técnico", "", ...approach, ""] : []),
+  ]);
+
+  const decisions = dimList(intv, ["auth_secrets", "rollback_compat", "tests"]);
+  appendOnce("docs/DECISIONS.md", marker, [
+    marker,
+    `## ${new Date().toISOString().slice(0, 10)} · ${f.id} aprobado`,
+    "",
+    `Contexto: se aprobó el spec \`${f.id}\` (${title}).`,
+    "",
+    ...(decisions.length ? ["Decisiones registradas:", "", ...decisions] : ["Decisión: implementar según el spec aprobado."]),
+    "",
+    "Consecuencia: futuras features deben respetar este contrato salvo nuevo ADR.",
+  ]);
+}
+
 function interview(id) {
   const spec = loadSpec();
   const f = feature(spec, id);
@@ -387,7 +427,8 @@ function approve(id) {
   f.spec_approved = true; f.approved_by = by; f.approved_at = new Date().toISOString();
   saveSpec(spec);
   const dir = writeSpecFolder(f, intv);
-  tryCommit(`spec.json ${dir}`, `spec: approve #${f.id} ${f.name}`);
+  writeDocsFromSpec(f, intv);
+  tryCommit(`spec.json ${dir} docs`, `spec: approve #${f.id} ${f.name}`);
   console.log(`Feature ${id} aprobada por ${by}. Spec durable en ${dir}/ (requirements, design, tasks)`);
 }
 
@@ -524,13 +565,19 @@ async function main() {
       const verdict = await runGates(task);
       record(state, task.id, { attempt, verdict, tts: (Date.now() - t0) / 1000, cost: run.cost });
       if (verdict.passed) {
-        sh(`git add -A && git commit -q -m "feat(${task.name}): ${task.title}"`);
+        try {
+          sh(`git add -A && git commit -q -m "feat(${task.name}): ${task.objective ?? task.name}"`);
+        } catch (e) {
+          if (!String(e.stdout).includes("nothing to commit")) throw e;
+        }
         task.status = task.sdd === false ? "done" : "review_pending";
         if (task.status === "review_pending") console.log(`Feature ${task.id} commiteada en '${branch}' → review_pending. Revisa el diff y cierra con: spec.mjs done ${task.id}`);
         ok = true; break;
       }
       lastFailure = verdict.failureOutput;
-      sh("git reset -q --hard HEAD"); sh("git clean -fdq"); // descarta el intento fallido (no toca lo ignorado)
+      if (attempt < maxAttempts) {
+        sh("git reset -q --hard HEAD"); sh("git clean -fdq"); // solo entre reintentos, no en el último
+      }
     }
     if (!ok) { task.status = "blocked"; console.error(`⚠️  BLOCKED: ${task.id} ${task.name} falló ${maxAttempts} veces.`); console.error(state.tasks[task.id]?.attempts.at(-1)?.verdict?.failureOutput ?? ""); }
     saveState(state);
@@ -549,7 +596,7 @@ import { execSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 
 const cfg = JSON.parse(readFileSync(new URL("./gates.config.json", import.meta.url)));
-const ALWAYS = ["docs/", "spec/", "progress/"]; // memoria: siempre permitida fuera del scope
+const ALWAYS = ["docs/", "spec/", "progress/", ".harness/"]; // memoria: siempre permitida fuera del scope
 
 function run(cmd) {
   try { return { ok: true, out: execSync(cmd, { stdio: "pipe", encoding: "utf8" }) }; }
@@ -559,11 +606,20 @@ function diffScopeGate(task) {
   const declared = task.scope ?? [];
   if (declared.length === 0) return { ok: true, out: "" };
   const changed = execSync("git status --porcelain -uall", { encoding: "utf8" })
-    .split("\n").map((l) => l.slice(3).trim()).filter(Boolean)
+    .split("\n").map((l) => unquoteStatusPath(l.slice(3).trim())).filter(Boolean)
     .map((p) => (p.includes(" -> ") ? p.split(" -> ")[1] : p)); // archivos modificados Y nuevos
   const allowed = [...declared, ...ALWAYS];
-  const outside = changed.filter((f) => !allowed.some((p) => f.startsWith(p)));
+  const outside = changed.filter((f) => !allowed.some((p) => {
+    const prefix = p.replace(/\/\*\*?$/, "/").replace(/\*$/, "");
+    return f.startsWith(prefix);
+  }));
   return outside.length === 0 ? { ok: true, out: "" } : { ok: false, out: `Archivos fuera de scope: ${outside.join(", ")}` };
+}
+function unquoteStatusPath(path) {
+  if (path.startsWith('"') && path.endsWith('"')) {
+    return JSON.parse(path);
+  }
+  return path;
 }
 export async function runGates(task) {
   const failures = [];
@@ -722,27 +778,66 @@ seed docs/README.md <<'EOF'
 - `DECISIONS.md` — registro de decisiones (ADR). El harness añade entradas al tomar decisiones relevantes.
 - `CONVENTIONS.md` — convenciones de código, naming, ramas.
 
-El agente lee esta carpeta antes de implementar. Mantenla actualizada: es lo que un agente nuevo
-(o tú dentro de tres meses) usa para ponerse al día.
+El agente lee esta carpeta antes de implementar. `spec.mjs approve` añade contexto mínimo automáticamente
+a `ARCHITECTURE.md` y `DECISIONS.md`, pero el dev debe rellenar la parte de visión y convenciones del repo.
+
+Mínimo útil antes de la primera feature:
+
+1. En `ARCHITECTURE.md`, completa objetivo del producto, componentes existentes y restricciones conocidas.
+2. En `CONVENTIONS.md`, completa cómo se ejecuta, testea y despliega este repo.
+3. En `DECISIONS.md`, deja cualquier decisión que no deba redescubrir otro agente.
 EOF
 seed docs/ARCHITECTURE.md <<'EOF'
 # Arquitectura
 
-> Rellena esto. El agente lo lee antes de implementar.
+> El agente lo lee antes de implementar. Mantén aquí el contexto que no cabe en una feature concreta.
 
 ## Visión general
 
+Producto/proyecto:
+
+Usuarios principales:
+
+Objetivo no negociable:
+
 ## Componentes
+
+- (rellenar) Componente:
+  - Responsabilidad:
+  - Entradas/salidas:
+  - Dueño/riesgo:
 
 ## Flujo de datos
 
+1. (rellenar)
+
+## Integraciones externas
+
+- (rellenar) Servicio/API:
+  - Contrato:
+  - Credenciales/config:
+  - Entorno local/CI:
+
+## Restricciones conocidas
+
+- (rellenar) Rendimiento, seguridad, compatibilidad, despliegue, coste, etc.
+
 ## Decisiones abiertas
+
+- (rellenar) Preguntas que bloquean diseño futuro.
+
+<!-- Los specs aprobados se anexan debajo con marcadores harness:<id>. -->
 EOF
 seed docs/DECISIONS.md <<'EOF'
 # Decisiones (ADR)
 
 Formato por entrada: **fecha · título** — contexto, decisión y consecuencias.
-El harness añade entradas cuando un agente toma una decisión de arquitectura relevante.
+El harness añade entradas cuando se aprueba un spec; el agente también debe añadir entradas cuando toma
+una decisión de arquitectura relevante durante implementación.
+
+## Pendientes de decisión
+
+- (rellenar) Decisiones que aún no deben asumirse automáticamente.
 
 <!-- Nuevas entradas debajo -->
 EOF
@@ -756,7 +851,34 @@ seed docs/CONVENTIONS.md <<'EOF'
 
 ## Estilo de código
 
-(añade aquí lo específico del repo)
+Lenguaje/framework principal:
+
+Gestor de paquetes:
+
+Comandos locales:
+
+- Instalar:
+- Lint:
+- Typecheck/build:
+- Test:
+- Dev server:
+
+Estructura relevante:
+
+- (rellenar) Carpeta:
+  - Propósito:
+
+Reglas de diseño/API:
+
+- (rellenar)
+
+Reglas de tests:
+
+- (rellenar)
+
+Reglas de despliegue:
+
+- (rellenar)
 EOF
 
 seed spec/README.md <<'EOF'
