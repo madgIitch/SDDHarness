@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# init.sh — Bootstrap del SDD Harness (agnóstico de repo y de agente).
+# init.sh — Bootstrap del SDD Harness (agnóstico de repo y de agente; no embebe ningún LLM).
 # Crea .harness/ + memoria (docs/ spec/ progress/), detecta el stack, escribe
 # gates.config.json, deja punteros en CLAUDE.md/AGENTS.md, parchea .gitignore.
 #
@@ -7,14 +7,13 @@
 #   bash init.sh            # instala (no clobbera spec.json, memoria ni punteros)
 #   bash init.sh --force    # reescribe también los scripts de .harness/
 #
-# Requisitos: bash, git, node. Elige agente con HARNESS_AGENT=claude|codex (def. claude).
+# Requisitos: bash, git, node. El agente es el de tu sesión; opcionalmente HARNESS_AGENT_CMD para el modo desatendido.
 
 set -euo pipefail
 
 FORCE=0
 [ "${1:-}" = "--force" ] && FORCE=1
 
-AGENT="${HARNESS_AGENT:-claude}"
 say()  { printf '  %s\n' "$1"; }
 step() { printf '\n== %s\n' "$1"; }
 warn() { printf '  ⚠️  %s\n' "$1" >&2; }
@@ -39,10 +38,7 @@ step "Comprobaciones previas"
 command -v git  >/dev/null 2>&1 || die "git no está en el PATH."
 command -v node >/dev/null 2>&1 || die "node no está en el PATH."
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "esto no es un repo git. Corre 'git init' primero."
-if [ "$AGENT" = "claude" ]; then command -v claude >/dev/null 2>&1 || warn "HARNESS_AGENT=claude pero 'claude' no está en el PATH.";
-elif [ "$AGENT" = "codex" ]; then command -v codex >/dev/null 2>&1 || warn "HARNESS_AGENT=codex pero 'codex' no está en el PATH.";
-else die "HARNESS_AGENT debe ser 'claude' o 'codex' (es '$AGENT')."; fi
-say "agente seleccionado: $AGENT"
+say "sin agente fijado: el harness no lanza LLMs (modo desatendido opcional con HARNESS_AGENT_CMD)"
 
 step "Creando .harness/"
 mkdir -p .harness/interviews
@@ -51,56 +47,33 @@ mkdir -p .harness/interviews
 write .harness/runner.mjs <<'RUNNER_EOF'
 import { spawnSync } from "node:child_process";
 
-const AGENT = (process.env.HARNESS_AGENT || "claude").toLowerCase(); // "claude" | "codex"
-const UNATTENDED = process.env.HARNESS_UNATTENDED === "1";
+// El harness NO lanza ningún LLM por defecto: el agente de la sesión (el que lee HARNESS.md)
+// entrevista, redacta el spec e implementa. El harness solo aporta estado, gates y memoria.
+//
+// Único uso de runAgent: el modo desatendido del orquestador (sin `--verify`). Ahí se delega en
+// el comando que fije HARNESS_AGENT_CMD (cualquier CLI que lea el prompt por stdin e imprima la
+// respuesta; HARNESS_AGENT_WRITE=1 indica que puede editar el repo). No hay proveedor ni modelo
+// por defecto: el que sea vive en tu CLI, no aquí.
 const IS_WIN = process.platform === "win32";
 const TIMEOUT = Number(process.env.HARNESS_TIMEOUT_MS || 900000); // 15 min por corrida
 
-const bin = (name) => process.env[`HARNESS_${name.toUpperCase()}_BIN`] || name;
-
-// Lanza el CLI pasando el PROMPT POR STDIN (input), no como argumento:
-//  - evita problemas de comillas/saltos de línea (sobre todo en Windows/cmd.exe);
-//  - al cerrar stdin se entrega EOF, lo que evita el cuelgue conocido de `codex exec`
-//    cuando lo invoca un proceso hijo no interactivo.
-// shell:true en Windows resuelve los shims .cmd/.exe (cmd.exe usa PATHEXT).
-function exec(name, args, prompt) {
-  const cmd = bin(name);
-  const res = spawnSync(cmd, args, {
-    input: prompt, encoding: "utf8", shell: IS_WIN, timeout: TIMEOUT,
-    maxBuffer: 64 * 1024 * 1024, stdio: ["pipe", "pipe", "inherit"],
-  });
-  if (res.error) {
-    const U = name.toUpperCase();
-    throw new Error(`No se pudo lanzar '${cmd}'. ¿Está en el PATH? Fija la ruta con HARNESS_${U}_BIN ` +
-      `(p.ej. PowerShell: $env:HARNESS_${U}_BIN='C:\\ruta\\${cmd}.exe').\nDetalle: ${res.error.message}`);
-  }
-  if (res.status !== 0) throw new Error(`'${cmd}' salió con código ${res.status}:\n${res.stdout || ""}`);
-  return res.stdout || "";
-}
-
 export function runAgent(prompt, { write = false } = {}) {
-  return AGENT === "codex" ? runCodex(prompt, write) : runClaude(prompt, write);
-}
-function runClaude(prompt, write) {
-  const tools = write ? "Edit,Write,Bash,Read,Grep,Glob" : "Read,Grep,Glob";
-  const args = ["-p", "--output-format", "json", "--max-turns", String(write ? 30 : 8), "--allowedTools", tools];
-  if (write && UNATTENDED) args.push("--dangerously-skip-permissions");
-  const j = JSON.parse(exec("claude", args, prompt));
-  return { text: j.result ?? "", cost: j.total_cost_usd ?? j.cost?.total_cost ?? null };
-}
-function runCodex(prompt, write) {
-  const sandbox = write ? "workspace-write" : "read-only";
-  const args = ["exec", "-s", sandbox];
-  if (UNATTENDED || write) args.push("-c", "approval_policy='never'");
-  args.push("-"); // '-' = leer el prompt completo desde stdin
-  return { text: exec("codex", args, prompt).trim(), cost: null };
-}
-
-export function extractJson(text) {
-  const clean = text.replace(/```json|```/g, "").trim();
-  const a = clean.indexOf("{"), b = clean.lastIndexOf("}");
-  if (a === -1 || b === -1) throw new Error("El agente no devolvió JSON:\n" + text.slice(0, 500));
-  return JSON.parse(clean.slice(a, b + 1));
+  const cmd = process.env.HARNESS_AGENT_CMD;
+  if (!cmd) {
+    throw new Error(
+      "No hay agente externo configurado (HARNESS_AGENT_CMD).\n" +
+      "Implementa la feature en tu sesión y cierra con: node .harness/orchestrator.mjs --verify <id>"
+    );
+  }
+  // Prompt por stdin: evita problemas de comillas/saltos de línea (sobre todo en Windows).
+  const res = spawnSync(cmd, {
+    input: prompt, encoding: "utf8", shell: true, timeout: TIMEOUT,
+    maxBuffer: 64 * 1024 * 1024, stdio: ["pipe", "pipe", "inherit"],
+    env: { ...process.env, HARNESS_AGENT_WRITE: write ? "1" : "0" },
+  });
+  if (res.error) throw new Error(`No se pudo lanzar HARNESS_AGENT_CMD (${cmd}): ${res.error.message}`);
+  if (res.status !== 0) throw new Error(`HARNESS_AGENT_CMD salió con código ${res.status}:\n${res.stdout || ""}`);
+  return { text: (res.stdout || "").trim(), cost: null };
 }
 RUNNER_EOF
 
@@ -124,7 +97,7 @@ function normalizeList(v) {
 // Extrae { dim/clave: respuesta } de los bloques "### [clave] ...\n**R:** ...".
 export function parseAnswers(md) {
   const out = {};
-  const re = /### \[([^\]]+)\][^\n]*\n+\*\*R:\*\*\s*([\s\S]*?)(?=\n### |\n## )/g;
+  const re = /### \[([^\]]+)\][^\n]*\n+\*\*R:\*\*[ \t]*([\s\S]*?)(?=\n### |\n## )/g;
   let m;
   while ((m = re.exec(md))) { const a = m[2].trim(); if (a) out[m[1]] = a; }
   return out;
@@ -182,7 +155,6 @@ INTERVIEW_EOF
 write .harness/spec.mjs <<'SPEC_EOF'
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { execSync } from "node:child_process";
-import { runAgent, extractJson } from "./runner.mjs";
 import { readInterview, writeInterview, renderInterview, interviewPath, answersHash } from "./interview.mjs";
 
 const SPEC = "spec.json";
@@ -192,11 +164,22 @@ const DIMENSIONS = [
   "external_contracts", "ui_states", "rollback_compat", "tests",
 ];
 
+// Pregunta base por dimensión: el entrevistador (el agente de la sesión) la sustituye por una concreta.
+const DIM_PROMPTS = {
+  data_model: "¿Qué datos, tipos o esquemas cambian o se crean, y quién es su fuente de verdad?",
+  error_states: "¿Qué puede fallar y qué ve o hace el sistema en cada caso?",
+  edge_cases: "¿Qué entradas límite, vacías o concurrentes hay que contemplar?",
+  auth_secrets: "¿Qué credenciales, permisos o secretos intervienen y dónde viven?",
+  external_contracts: "¿Qué contratos con APIs, paquetes o servicios externos se tocan o se exponen?",
+  ui_states: "¿Qué estados de interfaz (carga, vacío, error) cambian?",
+  rollback_compat: "¿Cómo se revierte y qué compatibilidad hacia atrás hay que mantener?",
+  tests: "¿Qué pruebas demuestran cada criterio de aceptación?",
+};
+
 const sh = (cmd) => execSync(cmd, { stdio: "pipe", encoding: "utf8" });
 const tryCommit = (paths, msg) => { try { sh(`git add ${paths}`); sh(`git commit -q -m ${JSON.stringify(msg)} -- ${paths}`); } catch {} };
 const loadSpec = () => JSON.parse(readFileSync(SPEC, "utf8"));
 const saveSpec = (s) => writeFileSync(SPEC, JSON.stringify(s, null, 2) + "\n");
-const ask = (prompt) => extractJson(runAgent(prompt, { write: false }).text);
 
 function normalizeList(v) {
   if (Array.isArray(v)) return v.map((x) => String(x).trim()).filter(Boolean);
@@ -329,75 +312,59 @@ function writeDocsFromSpec(f, intv) {
   ]);
 }
 
+// Determinista: crea la plantilla de entrevista. El agente de la sesión la rellena (preguntas
+// concretas, respuestas **R:**, cobertura ✅, scope y acceptance) y luego corre `answer`.
 function interview(id) {
   const spec = loadSpec();
   const f = feature(spec, id);
   if (f.sdd === false) { console.log(`Feature ${id} es sdd:false → sin entrevista. Apruébala: spec.mjs approve ${id}`); return; }
-  const prior = readInterview(f);
-  const res = ask([
-    "Eres entrevistador de especificaciones (SDD). NO escribas código. Lee docs/ si existe. Devuelve SOLO JSON.",
-    "Feature:", JSON.stringify({ id: f.id, name: f.name, title: f.title, description: f.description, acceptance: f.acceptance ?? [] }),
-    `Respuestas previas del dev: ${JSON.stringify(prior.answers)}`,
-    `Para CADA dimensión [${DIMENSIONS.join(", ")}] decide si la feature la deja resuelta.`,
-    'Si NO, genera una pregunta concreta de alto valor (NADA de relleno tipo "¿qué color?").',
-    'Propón "scope" (paths que puede tocar) y un "acceptance" refinado y testable.',
-    'Formato EXACTO: {"dimensions":{"<dim>":{"addressed":bool,"notes":"...","question":"...si addressed=false"}},"scope":[],"acceptance":[]}',
-  ].join("\n"));
-  res.dimensions = fillDims(res.dimensions);
-  writeInterview(f, renderInterview(f, res, prior.answers, []));
-  const open = DIMENSIONS.filter((d) => !res.dimensions[d].addressed);
-  if (open.length === 0) console.log(`Spec ${id}: dimensiones cubiertas de salida. Corre: spec.mjs answer ${id}`);
-  else { console.log(`Entrevista en ${interviewPath(f)} — preguntas abiertas:`); open.forEach((d) => console.log(`  [${d}] ${res.dimensions[d].question}`)); console.log(`Responde los **R:** y corre: spec.mjs answer ${id}`); }
+  const path = interviewPath(f);
+  if (existsSync(path)) { console.log(`La entrevista ya existe: ${path} (no se sobrescribe). Edítala y corre: spec.mjs answer ${id}`); return; }
+  const dimensions = Object.fromEntries(DIMENSIONS.map((d) => [d, { addressed: false, question: DIM_PROMPTS[d] }]));
+  writeInterview(f, renderInterview(f, { dimensions, scope: f.scope ?? [], acceptance: f.acceptance ?? [] }, {}, []));
+  console.log(`Plantilla creada en ${path}.`);
+  console.log("Rellénala (pregunta concreta y **R:** por dimensión abierta; pasa a ✅ las cubiertas) y corre: spec.mjs answer " + id);
 }
 
+// Determinista: lee la entrevista editada y decide si la spec está lista. Una dimensión cuenta
+// como cubierta si está marcada ✅ o tiene respuesta **R:**.
 function answer(id) {
   const spec = loadSpec();
   const f = feature(spec, id);
+  refuseParked(f);
   const prior = readInterview(f);
-  const existingAC = parseNumberedSection(prior.md, "Acceptance propuesto");
-  const existingScope = parseScopeSection(prior.md);
-  const revised = ask([
-    "Revisa esta spec integrando las respuestas del dev. NO escribas código. Devuelve SOLO JSON (mismo formato).",
-    `Feature: ${JSON.stringify({ id: f.id, title: f.title, description: f.description })}`,
-    `Cobertura previa: ${JSON.stringify(prior.dimensions)}`,
-    `Respuestas del dev: ${JSON.stringify(prior.answers)}`,
-    existingAC.length
-      ? `Criterios de aceptación existentes (presérvalos salvo que una respuesta del dev los vuelva más precisos): ${JSON.stringify(existingAC)}`
-      : "",
-    existingScope.length
-      ? `Scope existente (presérvalo salvo contradicción explícita): ${JSON.stringify(existingScope)}`
-      : "",
-    `Dimensiones: [${DIMENSIONS.join(", ")}]. Mismo formato JSON con dimensions/scope/acceptance.`,
-  ].filter(Boolean).join("\n"));
-  revised.dimensions = fillDims(revised.dimensions);
-  const finalAcceptance = existingAC.length ? existingAC : normalizeList(revised.acceptance);
-  const finalScope = existingScope.length ? existingScope : normalizeList(revised.scope);
-  const adv = ask([
-    "Eres QA de criterios de aceptación. Lista SOLO ambigüedades bloqueantes: casos donde no se puede decidir si el sistema PASA o FALLA sin una decisión de negocio adicional.",
-    "NO reportes detalles internos de implementación, testIDs, props de componentes, librerías, estructura de carpetas ni configuración de CI si no cambian el comportamiento observable.",
-    "SÍ reporta umbrales indefinidos, endpoints/rutas no especificadas, campos de request/response faltantes y comportamientos observables donde dos implementaciones razonables darían resultados distintos.",
-    `Spec: ${JSON.stringify({ scope: finalScope, acceptance: finalAcceptance })}`,
-    'Formato: {"guesses":["string"]} (vacío si no hay ninguno).',
-  ].join("\n"));
-  const guesses = normalizeGuesses(adv.guesses);
-  const ready = DIMENSIONS.every((d) => revised.dimensions[d].addressed === true);
-  writeInterview(f, renderInterview(f, { ...revised, scope: finalScope, acceptance: finalAcceptance }, prior.answers, guesses));
-  if (!ready) {
+  if (!prior.md) throw new Error(`No existe ${interviewPath(f)}. Corre antes: spec.mjs interview ${id}`);
+  const acceptance = parseNumberedSection(prior.md, "Acceptance propuesto");
+  const scope = parseScopeSection(prior.md);
+  const dimensions = {};
+  for (const d of DIMENSIONS) {
+    const cur = prior.dimensions[d] ?? {};
+    const question = prior.md.match(new RegExp(`### \[${d}\] ([^\n]*)`))?.[1] ?? DIM_PROMPTS[d];
+    dimensions[d] = { addressed: cur.addressed === true || Boolean(prior.answers[d]), notes: cur.notes && cur.notes !== "pendiente" ? cur.notes : "", question };
+  }
+  const missing = DIMENSIONS.filter((d) => !dimensions[d].addressed);
+  writeInterview(f, renderInterview(f, { dimensions, scope, acceptance }, prior.answers, []));
+  if (missing.length) {
     console.log(`Feature ${id} aún NO está lista — dimensiones sin cubrir:`);
-    DIMENSIONS.filter((d) => !revised.dimensions[d].addressed).forEach((d) => console.log(`  [${d}] ${revised.dimensions[d].question ?? ""}`));
-    if (guesses.length) console.log(`(${guesses.length} suposición(es) del implementador anotadas en el .md)`);
+    missing.forEach((d) => console.log(`  [${d}] ${dimensions[d].question}`));
     return;
   }
-  f.acceptance = finalAcceptance; f.scope = finalScope; f.status = "spec_ready";
+  if (!acceptance.length) throw new Error(`Falta "Acceptance propuesto" en ${interviewPath(f)}.`);
+  if (!scope.length) throw new Error(`Falta "Scope propuesto" en ${interviewPath(f)}.`);
+  f.acceptance = acceptance; f.scope = scope; f.status = "spec_ready";
   saveSpec(spec);
   console.log(`Feature ${id} → spec_ready (dimensiones cubiertas).`);
-  if (guesses.length) { console.log("⚠️  Suposiciones del implementador a revisar antes de approve:"); guesses.forEach((g) => console.log(`  - ${g}`)); }
-  console.log(`Aprueba con: spec.mjs approve ${id}`);
+  console.log(`Antes de aprobar, repasa ambigüedades bloqueantes del acceptance (QA adversarial). Aprueba con: spec.mjs approve ${id}`);
 }
 
+
+// Una feature apartada o pospuesta no se toca con answer / force-ready: lo reactivarían sin decirlo. Primero unshelve / unpostpone.
+const PARKED = ["shelved", "postponed"];
+const refuseParked = (f) => { if (PARKED.includes(f.status)) throw new Error(`Feature ${f.id} está ${f.status === "shelved" ? "apartada (shelved): reactívala con unshelve" : "pospuesta (postponed): reactívala con unpostpone"} antes de seguir con su entrevista.`); };
 function forceReady(id) {
   const spec = loadSpec();
   const f = feature(spec, id);
+  refuseParked(f);
   if (f.sdd === false) { console.log(`Feature ${id} es sdd:false; usa approve directo.`); return; }
   const prior = readInterview(f);
   const acceptance = parseNumberedSection(prior.md, "Acceptance propuesto");
@@ -441,9 +408,76 @@ function done(id) {
   console.log(`Feature ${id} → done. (Para descartarla en su lugar: git revert del commit feat(${f.name}).)`);
 }
 
-const [cmd, id] = process.argv.slice(2);
-const cmds = { interview, answer, "force-ready": forceReady, approve, done };
-if (!cmds[cmd] || !id) { console.log("Uso: node .harness/spec.mjs <interview|answer|force-ready|approve|done> <id>"); process.exit(1); }
+// Apartar una feature (decisión del dev): sale de la cola y de los avisos, conserva su spec y se puede reactivar.
+// Solo se aparta lo que aún no se ha implementado: una feature en review_pending/done se cierra o se revierte, no se aparta.
+const SHELVABLE = ["pending", "spec_ready", "blocked"];
+function shelve(id, reason) {
+  const spec = loadSpec();
+  const f = feature(spec, id);
+  if (f.status === "shelved") throw new Error(`Feature ${id} ya está apartada.`);
+  if (!SHELVABLE.includes(f.status)) throw new Error(`Feature ${id} está en ${f.status}: solo se pueden apartar ${SHELVABLE.join(", ")}. Una feature implementada se cierra con done o se revierte con git revert.`);
+  const why = String(reason ?? "").trim();
+  if (why.length < 10) throw new Error('Indica el motivo (mínimo 10 caracteres): node .harness/spec.mjs shelve <id> "motivo".');
+  const dependents = spec.features.filter((x) => x.status !== "done" && x.status !== "shelved" && (x.dependencies ?? []).includes(f.id));
+  f.shelved_from = f.status;
+  f.status = "shelved";
+  f.shelved_at = new Date().toISOString().slice(0, 10);
+  f.shelved_reason = why;
+  saveSpec(spec);
+  tryCommit("spec.json", `chore: #${f.id} ${f.name} → shelved`);
+  console.log(`Feature ${id} → shelved (estaba en ${f.shelved_from}). Sale de la cola; conserva su spec. Reactivar: spec.mjs unshelve ${id}`);
+  if (dependents.length) console.log(`⚠️  Dependen de ella y siguen vivas: ${dependents.map((x) => x.id).join(", ")}. Revisa si también deben apartarse.`);
+}
+
+function unshelve(id) {
+  const spec = loadSpec();
+  const f = feature(spec, id);
+  if (f.status !== "shelved") throw new Error(`Feature ${id} no está apartada (está en ${f.status}).`);
+  f.status = f.shelved_from === "pending" || f.shelved_from === "spec_ready" ? f.shelved_from : "spec_ready";
+  delete f.shelved_from; delete f.shelved_at; delete f.shelved_reason;
+  saveSpec(spec);
+  tryCommit("spec.json", `chore: #${f.id} ${f.name} → ${f.status} (reactivada)`);
+  console.log(`Feature ${id} reactivada → ${f.status}.`);
+}
+
+// Posponer una feature (decisión del dev): el spec es bueno, pero HOY no hace falta. A diferencia de shelved (no se va a hacer ahora, sin más), una pospuesta espera un
+// DISPARADOR: algo observable que diga «ahora sí» (un fallo que se repite, un número que se pasa, una petición). Sin disparador no se pospone: se aparta.
+// Conserva su entrevista, su spec y su aprobación; sale de la cola; el orquestador en seco la lista con su disparador para que no se olvide.
+const POSTPONABLE = ["pending", "spec_ready", "blocked"];
+function postpone(id, trigger) {
+  const spec = loadSpec();
+  const f = feature(spec, id);
+  if (f.status === "postponed") throw new Error(`Feature ${id} ya está pospuesta.`);
+  if (f.status === "shelved") throw new Error(`Feature ${id} está apartada (shelved): reactívala con unshelve antes de posponerla.`);
+  if (!POSTPONABLE.includes(f.status)) throw new Error(`Feature ${id} está en ${f.status}: solo se pueden posponer ${POSTPONABLE.join(", ")}. Una feature implementada se cierra con done o se revierte con git revert.`);
+  const when = String(trigger ?? "").trim();
+  if (when.length < 10) throw new Error('Indica el disparador, lo observable que dirá «ahora sí» (mínimo 10 caracteres): node .harness/spec.mjs postpone <id> "cuando …".');
+  const dependents = spec.features.filter((x) => x.status !== "done" && x.status !== "shelved" && x.status !== "postponed" && (x.dependencies ?? []).includes(f.id));
+  f.postponed_from = f.status;
+  f.status = "postponed";
+  f.postponed_at = new Date().toISOString().slice(0, 10);
+  f.postponed_trigger = when;
+  saveSpec(spec);
+  tryCommit("spec.json", `chore: #${f.id} ${f.name} → postponed`);
+  console.log(`Feature ${id} → postponed (estaba en ${f.postponed_from}). Sale de la cola; conserva su spec y su aprobación. Disparador: ${when}`);
+  console.log(`Reactivar cuando se cumpla: spec.mjs unpostpone ${id}`);
+  if (dependents.length) console.log(`⚠️  Dependen de ella y siguen vivas: ${dependents.map((x) => x.id).join(", ")}. No podrán avanzar mientras esté pospuesta: revisa si también deben posponerse.`);
+}
+
+function unpostpone(id) {
+  const spec = loadSpec();
+  const f = feature(spec, id);
+  if (f.status !== "postponed") throw new Error(`Feature ${id} no está pospuesta (está en ${f.status}).`);
+  f.status = f.postponed_from === "pending" || f.postponed_from === "spec_ready" ? f.postponed_from : "spec_ready";
+  delete f.postponed_from; delete f.postponed_at; delete f.postponed_trigger;
+  saveSpec(spec);
+  tryCommit("spec.json", `chore: #${f.id} ${f.name} → ${f.status} (reactivada)`);
+  console.log(`Feature ${id} reactivada → ${f.status}.`);
+}
+
+const [cmd, id, ...rest] = process.argv.slice(2);
+const cmds = { interview, answer, "force-ready": forceReady, approve, done, shelve: (x) => shelve(x, rest.join(" ")), unshelve, postpone: (x) => postpone(x, rest.join(" ")), unpostpone };
+if (!cmds[cmd] || !id) { console.log('Uso: node .harness/spec.mjs <interview|answer|force-ready|approve|done|unshelve|unpostpone> <id>  |  shelve <id> "motivo"  |  postpone <id> "disparador"'); process.exit(1); }
 cmds[cmd](id);
 SPEC_EOF
 
@@ -458,6 +492,11 @@ import { runAgent } from "./runner.mjs";
 import { interviewPath, parseAnswers, answersHash } from "./interview.mjs";
 
 const DRY = process.argv.includes("--dry-run");
+// --verify <id>: la feature ya está implementada en la sesión; solo corre gates y cierra el ciclo
+// (progreso, review, commit). No llama a ningún agente externo.
+const VERIFY_AT = process.argv.indexOf("--verify");
+const VERIFY_ID = VERIFY_AT === -1 ? null : process.argv[VERIFY_AT + 1];
+if (VERIFY_AT !== -1 && !VERIFY_ID) { console.error("Uso: node .harness/orchestrator.mjs --verify <id>"); process.exit(1); }
 const PRI = { P0: 0, P1: 1, P2: 2, P3: 3 };
 const PDIR = "progress";
 const sh = (cmd) => execSync(cmd, { stdio: "pipe", encoding: "utf8" });
@@ -510,7 +549,7 @@ function writeProgress(task, state, branch) {
   mkdirSync(PDIR, { recursive: true });
   const attempts = state.tasks[task.id]?.attempts ?? [];
   const ts = new Date().toISOString();
-  const agent = process.env.HARNESS_AGENT || "claude";
+  const agent = VERIFY_ID ? "sesión" : (process.env.HARNESS_AGENT_CMD ? "externo" : "sesión");
   const table = attemptsTable(attempts);
 
   const impl = `${PDIR}/impl_${task.name}.md`;
@@ -537,18 +576,28 @@ function writeProgress(task, state, branch) {
 async function main() {
   const spec = loadSpec();
   const state = loadState();
-  const maxAttempts = spec.rules?.max_attempts ?? 3;
-  const queue = spec.features.filter(consumable).sort((a, b) => (PRI[a.priority] ?? 9) - (PRI[b.priority] ?? 9));
+  const maxAttempts = VERIFY_ID ? 1 : (spec.rules?.max_attempts ?? 3);
+  const queue = (VERIFY_ID
+    ? spec.features.filter((f) => String(f.id) === String(VERIFY_ID) && consumable(f))
+    : spec.features.filter(consumable)).sort((a, b) => (PRI[a.priority] ?? 9) - (PRI[b.priority] ?? 9));
 
   if (DRY) {
     console.log(`Cola (aprobadas y pendientes): ${queue.length}`);
     queue.forEach((f) => console.log(`  - [${f.priority}] ${f.id} ${f.name}${f.sdd ? "" : " (sdd:false)"}`));
     const waiting = spec.features.filter((f) => f.sdd && f.status === "spec_ready" && !f.spec_approved);
     if (waiting.length) console.log(`Esperando aprobación: ${waiting.map((f) => f.id).join(", ")}`);
+    const shelved = spec.features.filter((f) => f.status === "shelved");
+    if (shelved.length) console.log(`Apartadas (shelved, fuera de la cola): ${shelved.map((f) => f.id).join(", ")}`);
+    const postponed = spec.features.filter((f) => f.status === "postponed");
+    if (postponed.length) { console.log(`Pospuestas (postponed, fuera de la cola, esperan su disparador):`); postponed.forEach((f) => console.log(`  - ${f.id}: ${f.postponed_trigger ?? "(sin disparador)"}`)); }
     return;
   }
 
-  const dirty = sh("git status --porcelain").trim();
+  if (VERIFY_ID && !queue.length) {
+    console.error(`La feature ${VERIFY_ID} no existe, no está aprobada, está apartada (shelved) o pospuesta (postponed), su entrevista cambió tras aprobar o no está en pending/spec_ready.`);
+    process.exit(1);
+  }
+  const dirty = VERIFY_ID ? "" : sh("git status --porcelain").trim();
   if (dirty) {
     console.error("⚠️  Working tree no limpio. Commitea o descarta los cambios antes de correr el harness:\n" + dirty);
     process.exit(1);
@@ -557,11 +606,12 @@ async function main() {
 
   for (const task of queue) {
     let lastFailure = null, ok = false;
+    const prevStatus = task.status;
     task.status = "in_progress";
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       const t0 = Date.now();
       const prompt = lastFailure ? buildRetryPrompt(task, lastFailure, attempt) : buildInitialPrompt(task);
-      const run = runAgent(prompt, { write: true });
+      const run = VERIFY_ID ? { cost: null } : runAgent(prompt, { write: true });
       const verdict = await runGates(task);
       record(state, task.id, { attempt, verdict, tts: (Date.now() - t0) / 1000, cost: run.cost });
       if (verdict.passed) {
@@ -575,6 +625,14 @@ async function main() {
         ok = true; break;
       }
       lastFailure = verdict.failureOutput;
+      if (VERIFY_ID) {
+        // Verificación fallida: la sesión corrige y reintenta; no se marca blocked ni se descarta nada.
+        task.status = prevStatus;
+        console.error(`Gates fallidos para ${task.id} ${task.name}. Corrige y reintenta con --verify ${task.id}.
+${lastFailure ?? ""}`);
+        saveState(state);
+        process.exit(1);
+      }
       if (attempt < maxAttempts) {
         sh("git reset -q --hard HEAD"); sh("git clean -fdq"); // solo entre reintentos, no en el último
       }
@@ -593,27 +651,78 @@ ORCH_EOF
 # ------------------------------------------------------------------ gates.mjs
 write .harness/gates.mjs <<'GATES_EOF'
 import { execSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 
 const cfg = JSON.parse(readFileSync(new URL("./gates.config.json", import.meta.url)));
 const ALWAYS = ["docs/", "spec/", "progress/", ".harness/"]; // memoria: siempre permitida fuera del scope
 
+// 64 MB: la salida completa de la suite no debe cortarse ni matar el proceso (el límite por defecto de execSync es 1 MB).
+const MAX_BUFFER = 64 * 1024 * 1024;
 function run(cmd) {
-  try { return { ok: true, out: execSync(cmd, { stdio: "pipe", encoding: "utf8" }) }; }
-  catch (e) { return { ok: false, out: (e.stdout ?? "") + (e.stderr ?? "") }; }
+  try { return { ok: true, out: execSync(cmd, { stdio: "pipe", encoding: "utf8", maxBuffer: MAX_BUFFER }) }; }
+  catch (e) { return { ok: false, out: (e.stdout ?? "") + (e.stderr ?? "") + (e.code === "ENOBUFS" ? "\n[gates] salida demasiado grande: el proceso se cortó" : "") }; }
 }
-function diffScopeGate(task) {
+
+/**
+ * Resumen de la salida de un gate fallido. Los runners (vitest, tsc, eslint, pytest) dejan los fallos al final o repartidos entre
+ * cientos de líneas en verde, así que nunca se toma el principio: se toman las líneas que señalan un fallo y el final de la salida.
+ * La salida completa queda en `.harness/logs/` (ver `saveLog`).
+ */
+const ANSI = /\u001b\[[0-9;?]*[ -/]*[@-~]/g;
+const SIGNAL = [
+  /(^|\s)(FAIL|FAILED)\b/, // vitest y pytest
+  /(^|\s)[×✗✖]\s/, // test fallido en vitest
+  /AssertionError|TypeError|ReferenceError|SyntaxError/,
+  /^\s*(Error|ERROR)\b/,
+  /error TS\d+/, // tsc
+  /\s\d+:\d+\s+error\s/, // eslint
+  /^\s*(Expected|Received)\b|expected .* to /, // aserciones
+  /Test Files\s|^\s*Tests\s+\d/, // resumen de vitest
+  /^\s*❯ .*\.(test|spec)\.[cm]?[tj]sx?:\d+/, // posición del fallo en vitest
+  /^E\s{2,}|short test summary/, // pytest
+  /Archivos fuera de scope|warnings \(máx|\[gates\]/, // gates propios
+];
+export function failureDigest(raw, { maxLines = 60, tailChars = 2500 } = {}) {
+  const out = String(raw ?? "").replace(ANSI, "").replace(/\r/g, "");
+  const seen = new Set(), signals = [];
+  for (const line of out.split("\n")) {
+    const text = line.trimEnd();
+    // Las líneas JSON son logs de la app durante los tests ({"event":…,"message":"TypeError"}), no fallos.
+    if (!text.trim() || text.trimStart().startsWith("{") || seen.has(text) || !SIGNAL.some((pattern) => pattern.test(text))) continue;
+    seen.add(text);
+    signals.push(text.length > 300 ? `${text.slice(0, 300)}…` : text);
+    if (signals.length >= maxLines) { signals.push("… (más líneas de fallo en el log completo)"); break; }
+  }
+  const tail = out.length > tailChars ? `…${out.slice(-tailChars)}` : out;
+  return [signals.length ? `Líneas de fallo:\n${signals.join("\n")}` : "Sin líneas de fallo reconocibles.", `Final de la salida:\n${tail.trim()}`].join("\n\n");
+}
+
+/** Guarda la salida completa del gate fallido (se sobrescribe en cada intento) y devuelve su ruta relativa al repo. */
+export function saveLog(task, gateName, out, dir = new URL("./logs/", import.meta.url)) {
+  try {
+    mkdirSync(dir, { recursive: true });
+    const name = `${String(task?.id ?? "sin-id").replace(/[^\w.-]+/g, "_")}-${String(gateName).replace(/[^\w.-]+/g, "_")}.log`;
+    writeFileSync(new URL(name, dir), String(out ?? "").replace(ANSI, ""));
+    return `.harness/logs/${name}`;
+  } catch { return null; }
+}
+
+export function diffScopeGate(task) {
   const declared = task.scope ?? [];
   if (declared.length === 0) return { ok: true, out: "" };
   const changed = execSync("git status --porcelain -uall", { encoding: "utf8" })
     .split("\n").map((l) => unquoteStatusPath(l.slice(3).trim())).filter(Boolean)
     .map((p) => (p.includes(" -> ") ? p.split(" -> ")[1] : p)); // archivos modificados Y nuevos
   const allowed = [...declared, ...ALWAYS];
-  const outside = changed.filter((f) => !allowed.some((p) => {
-    const prefix = p.replace(/\/\*\*?$/, "/").replace(/\*$/, "");
-    return f.startsWith(prefix);
-  }));
+  const outside = changed.filter((f) => !allowed.some((p) => matchesScope(f, p)));
   return outside.length === 0 ? { ok: true, out: "" } : { ok: false, out: `Archivos fuera de scope: ${outside.join(", ")}` };
+}
+function matchesScope(path, pattern) {
+  if (!pattern.includes("*")) return path === pattern || (pattern.endsWith("/") && path.startsWith(pattern));
+  if (pattern.endsWith("/**")) return path.startsWith(pattern.slice(0, -2));
+  const escaped = pattern.replace(/[.+?^${}()|[\]\\]/g, "\\$&");
+  const expression = escaped.replace(/\*\*\//g, "(?:.*/)?").replace(/\*\*/g, ".*").replace(/\*/g, "[^/]*");
+  return new RegExp(`^${expression}$`).test(path);
 }
 function unquoteStatusPath(path) {
   if (path.startsWith('"') && path.endsWith('"')) {
@@ -629,7 +738,12 @@ export async function runGates(task) {
       const n = (res.out.match(new RegExp(gate.warningPattern, "g")) ?? []).length;
       if (n > gate.maxWarnings) res = { ok: false, out: `${n} warnings (máx ${gate.maxWarnings})\n${res.out}` };
     }
-    if (!res.ok) { failures.push(`### Gate fallido: ${gate.name}\n${res.out.slice(0, 4000)}`); if (gate.blocking !== false) break; }
+    if (!res.ok) {
+      // Antes se guardaban los primeros 4000 caracteres: con vitest eran siempre tests en verde y el fallo quedaba fuera.
+      const log = saveLog(task, gate.name, res.out);
+      failures.push(`### Gate fallido: ${gate.name}\n${failureDigest(res.out)}${log ? `\n\nSalida completa: ${log}` : ""}`);
+      if (gate.blocking !== false) break;
+    }
   }
   return { passed: failures.length === 0, failureOutput: failures.join("\n\n") };
 }
@@ -937,13 +1051,16 @@ cat <<'DONE'
 
 ✅ Harness + memoria instalados. Próximos pasos:
 
-   export HARNESS_AGENT=claude        # o codex
    # rellena docs/ARCHITECTURE.md y docs/CONVENTIONS.md con el contexto del repo
-   node .harness/spec.mjs interview 1 # escribe .harness/interviews/<id>-<name>.md
-   #   responde los **R:** en ese archivo
-   node .harness/spec.mjs answer 1    # integra respuestas + pase adversarial → spec_ready
-   node .harness/spec.mjs approve 1   # → escribe spec/<id>-<name>/{requirements,design,tasks}.md
-   node .harness/orchestrator.mjs     # → escribe progress/{current,history,impl_<name>}.md
+   # y deja que el agente de tu sesión lea HARNESS.md (CLAUDE.md / AGENTS.md ya lo apuntan)
+   node .harness/spec.mjs interview 1   # plantilla en .harness/interviews/<id>-<name>.md (sin IA)
+   #   el agente la rellena con el dev: preguntas, **R:**, ✅, scope y acceptance
+   node .harness/spec.mjs answer 1      # valida cobertura → spec_ready
+   node .harness/spec.mjs approve 1     # (dev) → spec/<id>-<name>/{requirements,design,tasks}.md
+   #   el agente implementa en la sesión
+   node .harness/orchestrator.mjs --verify 1   # gates + commit + progress/ → review_pending
+   node .harness/spec.mjs done 1        # tras el smoke test humano
 
-   ⚠️ Para aislar la corrida usa un git worktree/contenedor (HARNESS_UNATTENDED=1 da escritura sin confirmación).
+   Modo desatendido (opcional): HARNESS_AGENT_CMD="<cli que lee el prompt por stdin>" node .harness/orchestrator.mjs
+   ⚠️ Aíslalo con un git worktree/contenedor: el agente externo escribe sin confirmación.
 DONE
